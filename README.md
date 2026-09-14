@@ -44,14 +44,18 @@ Other distributions are not supported.
 
 ## Installation
 
-Run as root, from an SSH session:
+Run as root. Download the script first, then execute it:
 
 ```bash
 curl -fsSLo install.sh https://raw.githubusercontent.com/burnersen/xrdp-xfce-installer/refs/heads/main/install.sh
 bash install.sh
 ```
 
-On an unstable connection, start `tmux` first. If the connection drops, reconnect and run `tmux attach` to pick the installation up where it left off.
+If you are not root yet, run `sudo -i` first, as a separate step. Do not paste it together with the commands above: `sudo -i` opens a new shell that swallows the following line.
+
+Downloading first also lets you read the script before running it, which is good practice for anything executed as root.
+
+On an unstable connection, start `tmux` before the installation. If the connection drops, reconnect and run `tmux attach` to pick the installation up where it left off.
 
 The installer asks for:
 
