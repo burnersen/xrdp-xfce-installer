@@ -3,7 +3,16 @@ set -Eeuo pipefail
 
 # ==========================================================
 # XRDP + XFCE Remote Desktop Installer
+#
 # Ubuntu 20.04+
+#
+# Features:
+#   - XFCE desktop reachable over RDP
+#   - Persistent sessions (reconnect from any device/IP)
+#   - Custom RDP port
+#   - UFW firewall (SSH access is preserved)
+#   - fail2ban for SSH and XRDP
+#   - Optional: JDownloader 2 (desktop app or headless service)
 # ==========================================================
 
 on_error() {
@@ -117,6 +126,38 @@ is_valid_ipv4() {
 }
 
 
+# Set a key in an INI style file.
+#
+# Replaces the active key, uncomments a commented key,
+# or appends the key if it is missing entirely.
+
+set_ini_key() {
+
+    local file="$1"
+    local key="$2"
+    local value="$3"
+
+    if [[ ! -f "$file" ]]; then
+        echo "WARNING: $file not found, skipping $key."
+        return 0
+    fi
+
+    if grep -qE "^[[:space:]]*${key}=" "$file"; then
+
+        sed -i -E "s|^[[:space:]]*${key}=.*|${key}=${value}|" "$file"
+
+    elif grep -qE "^[[:space:]]*[;#][[:space:]]*${key}=" "$file"; then
+
+        sed -i -E "0,/^[[:space:]]*[;#][[:space:]]*${key}=.*/s||${key}=${value}|" "$file"
+
+    else
+
+        printf '%s=%s\n' "$key" "$value" >> "$file"
+
+    fi
+}
+
+
 # ----------------------------------------------------------
 # USERNAME
 # ----------------------------------------------------------
@@ -177,9 +218,52 @@ fi
 
 
 # ----------------------------------------------------------
-# RDP ACCESS
+# RDP PORT
 #
-# Restricted to one IPv4 address by default.
+# The default port 3389 is scanned constantly by bots.
+# A non standard port removes most of that noise.
+# ----------------------------------------------------------
+
+echo
+
+read -rp \
+    "RDP port [3389]: " \
+    RDP_PORT < /dev/tty
+
+RDP_PORT="${RDP_PORT:-3389}"
+
+if ! [[ "$RDP_PORT" =~ ^[0-9]+$ ]] ||
+   (( RDP_PORT < 1 || RDP_PORT > 65535 )); then
+
+    echo "ERROR: Invalid port number." >&2
+    exit 1
+fi
+
+if (( RDP_PORT < 1024 )) && (( RDP_PORT != 3389 )); then
+    echo "ERROR: Ports below 1024 are reserved for system services." >&2
+    exit 1
+fi
+
+# Ports that would collide with other common services.
+
+for RESERVED in 22 80 443 3350 5900 9666; do
+
+    if (( RDP_PORT == RESERVED )); then
+        echo "ERROR: Port $RDP_PORT is used by another service." >&2
+        exit 1
+    fi
+
+done
+
+if (( RDP_PORT == 3389 )); then
+    echo "NOTE: Using the default RDP port. Expect automated scans."
+else
+    echo "NOTE: Clients must connect using <SERVER_IP>:$RDP_PORT"
+fi
+
+
+# ----------------------------------------------------------
+# RDP ACCESS
 # ----------------------------------------------------------
 
 echo
@@ -195,7 +279,7 @@ if [[ "$LIMIT_RDP" =~ ^[Yy]$ ]]; then
     while true; do
 
         read -rp \
-            "Enter allowed public IPv4 address for RDP (3389): " \
+            "Enter allowed public IPv4 address: " \
             ALLOWED_IP < /dev/tty
 
         if is_valid_ipv4 "$ALLOWED_IP"; then
@@ -213,7 +297,8 @@ elif [[ "$LIMIT_RDP" =~ ^[Nn]$ ]]; then
 
     echo
     echo "WARNING:"
-    echo "TCP port 3389 will be accessible from the Internet."
+    echo "TCP port $RDP_PORT will be accessible from the Internet."
+    echo "Use a long, randomly generated password."
     echo
 
     read -rp \
@@ -232,6 +317,53 @@ else
 
     echo "ERROR: Please answer y or n." >&2
     exit 1
+
+fi
+
+
+# ----------------------------------------------------------
+# OPTIONAL COMPONENTS
+# ----------------------------------------------------------
+
+echo
+
+read -rp \
+    "Install JDownloader 2? [y/N]: " \
+    INSTALL_JD < /dev/tty
+
+INSTALL_JD="${INSTALL_JD:-N}"
+
+JD_MODE="none"
+
+if [[ "$INSTALL_JD" =~ ^[Yy]$ ]]; then
+
+    echo
+    echo "How should JDownloader run?"
+    echo
+    echo "  1) Desktop application"
+    echo "     Runs inside the XFCE session."
+    echo "     Full GUI, works together with a browser on the same"
+    echo "     machine (Click'n'Load)."
+    echo "     Stops when the session is logged out."
+    echo
+    echo "  2) Headless service"
+    echo "     Runs as a systemd service, starts at boot."
+    echo "     No GUI, controlled through my.jdownloader.org."
+    echo "     Survives reboots and disconnects."
+    echo
+
+    read -rp \
+        "Select [1/2]: " \
+        JD_CHOICE < /dev/tty
+
+    case "$JD_CHOICE" in
+        1) JD_MODE="desktop" ;;
+        2) JD_MODE="service" ;;
+        *)
+            echo "ERROR: Please select 1 or 2." >&2
+            exit 1
+            ;;
+    esac
 
 fi
 
@@ -273,7 +405,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[1/10] Updating system"
+echo "[1/12] Updating system"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -286,7 +418,7 @@ apt-get upgrade -y
 # ----------------------------------------------------------
 
 echo
-echo "[2/10] Installing XFCE, XRDP and dependencies"
+echo "[2/12] Installing XFCE, XRDP and dependencies"
 
 apt-get install -y \
     sudo \
@@ -298,7 +430,10 @@ apt-get install -y \
     dbus-x11 \
     x11-xserver-utils \
     ufw \
+    fail2ban \
+    tmux \
     wget \
+    curl \
     ca-certificates \
     gnupg
 
@@ -307,7 +442,6 @@ apt-get install -y \
 # POLKIT PACKAGE
 #
 # Package name differs between Ubuntu releases.
-# Keep it separate from the main dependency installation.
 # ----------------------------------------------------------
 
 POLKIT_PKG=""
@@ -336,15 +470,107 @@ fi
 
 
 # ----------------------------------------------------------
+# FUSE 2 (APPIMAGE SUPPORT)
+#
+# AppImages require libfuse.so.2. Ubuntu 24.04 and newer no
+# longer ship it by default, and renamed the package to
+# libfuse2t64.
+#
+# Without it, AppImages fail to start with a message about a
+# missing FUSE library.
+# ----------------------------------------------------------
+
+FUSE_PKG=""
+
+if apt-cache show libfuse2t64 >/dev/null 2>&1; then
+
+    FUSE_PKG="libfuse2t64"
+
+elif apt-cache show libfuse2 >/dev/null 2>&1; then
+
+    FUSE_PKG="libfuse2"
+
+fi
+
+if [[ -n "$FUSE_PKG" ]]; then
+
+    echo "Installing FUSE 2 package for AppImage support: $FUSE_PKG"
+
+    if ! apt-get install -y "$FUSE_PKG" fuse3; then
+        echo "WARNING: FUSE installation failed. AppImages may not start."
+    fi
+
+else
+
+    echo "WARNING: No FUSE 2 package found. AppImages may not start."
+
+fi
+
+
+# ----------------------------------------------------------
 # XRDP CONFIGURATION
 # ----------------------------------------------------------
 
 echo
-echo "[3/10] Configuring XRDP"
+echo "[3/12] Configuring XRDP"
 
 if getent group ssl-cert >/dev/null 2>&1; then
     usermod -aG ssl-cert xrdp
 fi
+
+XRDP_INI="/etc/xrdp/xrdp.ini"
+SESMAN_INI="/etc/xrdp/sesman.ini"
+
+if [[ -f "$XRDP_INI" && ! -f "${XRDP_INI}.orig" ]]; then
+    cp "$XRDP_INI" "${XRDP_INI}.orig"
+fi
+
+if [[ -f "$SESMAN_INI" && ! -f "${SESMAN_INI}.orig" ]]; then
+    cp "$SESMAN_INI" "${SESMAN_INI}.orig"
+fi
+
+# Listening port.
+
+set_ini_key "$XRDP_INI" "port" "$RDP_PORT"
+
+# Fixed colour depth.
+#
+# XRDP creates a SEPARATE session per colour depth. Different
+# clients negotiate different values, which silently produces
+# several parallel sessions for the same user.
+#
+# Capping the value keeps all clients in one single session.
+
+set_ini_key "$XRDP_INI" "max_bpp" "24"
+
+
+# ----------------------------------------------------------
+# PERSISTENT SESSIONS
+#
+# The goal: reconnecting from any client, any IP and any
+# window size lands in the SAME session, with all running
+# applications still open.
+#
+#   Policy=Default            session per <User,BitPerPixel>
+#   KillDisconnected=false    keep the session after disconnect
+#   DisconnectedTimeLimit=0   never expire a disconnected session
+#
+# Note: combined with max_bpp above, "Default" means exactly
+# one session per user.
+# ----------------------------------------------------------
+
+echo
+echo "[4/12] Configuring persistent sessions"
+
+set_ini_key "$SESMAN_INI" "Policy" "Default"
+set_ini_key "$SESMAN_INI" "KillDisconnected" "false"
+set_ini_key "$SESMAN_INI" "DisconnectedTimeLimit" "0"
+set_ini_key "$SESMAN_INI" "IdleTimeLimit" "0"
+
+# A low limit surfaces stale sessions early instead of
+# letting dozens of them pile up unnoticed.
+
+set_ini_key "$SESMAN_INI" "MaxSessions" "3"
 
 systemctl enable xrdp
 
@@ -357,7 +583,7 @@ systemctl restart xrdp
 # ----------------------------------------------------------
 
 echo
-echo "[4/10] Configuring user '$USERNAME'"
+echo "[5/12] Configuring user '$USERNAME'"
 
 if [[ "$USER_EXISTS" == false ]]; then
 
@@ -408,7 +634,7 @@ USER_GROUP="$(id -gn "$USERNAME")"
 # ----------------------------------------------------------
 
 echo
-echo "[5/10] Configuring XFCE session"
+echo "[6/12] Configuring XFCE session"
 
 cat > "$HOME_DIR/.xsession" <<'EOF'
 exec startxfce4
@@ -428,7 +654,7 @@ chmod 0644 "$HOME_DIR/.xsession"
 # ----------------------------------------------------------
 
 echo
-echo "[6/10] Configuring polkit for XRDP"
+echo "[7/12] Configuring polkit for XRDP"
 
 if command -v pkaction >/dev/null 2>&1; then
 
@@ -521,7 +747,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[7/10] Configuring UFW"
+echo "[8/12] Configuring UFW"
 
 declare -a SSH_PORTS=()
 
@@ -605,10 +831,9 @@ done
 # ----------------------------------------------------------
 # REMOVE OLD RDP FIREWALL RULES
 #
-# Remove ALL existing UFW rules for port 3389 before adding
-# the new restricted rule.
-#
-# This prevents an old "ALLOW Anywhere" rule from remaining.
+# Removes existing rules for the default port and for the
+# configured port, so an old "ALLOW Anywhere" rule cannot
+# survive the installation.
 # ----------------------------------------------------------
 
 UFW_ADDED_RULES="$(
@@ -626,22 +851,26 @@ while IFS= read -r UFW_LINE; do
 
     IS_RDP_RULE=false
 
-    # Examples:
-    #
-    # allow 3389
-    # allow 3389/tcp
+    for CHECK_PORT in 3389 "$RDP_PORT"; do
 
-    if [[ "$RULE" =~ ^(allow|deny|reject|limit)[[:space:]]+3389(/tcp)?([[:space:]]|$) ]]; then
-        IS_RDP_RULE=true
-    fi
+        # Examples:
+        #
+        # allow 3389
+        # allow 3389/tcp
 
-    # Example:
-    #
-    # allow from 203.0.113.10 to any port 3389 proto tcp
+        if [[ "$RULE" =~ ^(allow|deny|reject|limit)[[:space:]]+${CHECK_PORT}(/tcp)?([[:space:]]|$) ]]; then
+            IS_RDP_RULE=true
+        fi
 
-    if [[ "$RULE" =~ to[[:space:]]+any[[:space:]]+port[[:space:]]+3389([[:space:]]|$) ]]; then
-        IS_RDP_RULE=true
-    fi
+        # Example:
+        #
+        # allow from 203.0.113.10 to any port 3389 proto tcp
+
+        if [[ "$RULE" =~ to[[:space:]]+any[[:space:]]+port[[:space:]]+${CHECK_PORT}([[:space:]]|$) ]]; then
+            IS_RDP_RULE=true
+        fi
+
+    done
 
     if [[ "$IS_RDP_RULE" == true ]]; then
 
@@ -684,7 +913,7 @@ if [[ "$LIMIT_RDP" =~ ^[Yy]$ ]]; then
     ufw allow \
         from "$ALLOWED_IP" \
         to any \
-        port 3389 \
+        port "$RDP_PORT" \
         proto tcp \
         comment "XRDP"
 
@@ -693,7 +922,7 @@ if [[ "$LIMIT_RDP" =~ ^[Yy]$ ]]; then
 else
 
     ufw allow \
-        3389/tcp \
+        "${RDP_PORT}/tcp" \
         comment "XRDP"
 
     echo "WARNING: RDP is accessible from any IP."
@@ -704,19 +933,81 @@ ufw --force enable
 
 
 # ----------------------------------------------------------
+# FAIL2BAN
+#
+# Bans an IP after repeated failed logins. The port stays
+# open for everyone else.
+#
+# Ubuntu ships a filter for SSH only, so the XRDP filter is
+# created here.
+# ----------------------------------------------------------
+
+echo
+echo "[9/12] Configuring fail2ban"
+
+SESMAN_LOG="/var/log/xrdp-sesman.log"
+
+cat > /etc/fail2ban/filter.d/xrdp.conf <<'EOF'
+# Matches the AUTHFAIL line written by xrdp-sesman, e.g.
+#
+#   [20260101-12:00:00] [INFO ] AUTHFAIL: user=name ip=::ffff:203.0.113.10 time=...
+#
+# The optional ::ffff: prefix is how an IPv4 address is
+# represented inside an IPv6 field.
+
+[Definition]
+failregex = AUTHFAIL: user=\S* ip=(?:::ffff:)?<HOST>
+ignoreregex =
+datepattern = ^\[%%Y%%m%%d-%%H:%%M:%%S\]
+EOF
+
+chmod 0644 /etc/fail2ban/filter.d/xrdp.conf
+
+cat > /etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+
+[xrdp]
+enabled  = true
+port     = $RDP_PORT
+filter   = xrdp
+logpath  = $SESMAN_LOG
+backend  = auto
+maxretry = 5
+bantime  = 1h
+EOF
+
+chmod 0644 /etc/fail2ban/jail.local
+
+# fail2ban refuses to start a jail whose log file is missing.
+
+if [[ ! -f "$SESMAN_LOG" ]]; then
+    touch "$SESMAN_LOG"
+    chmod 0640 "$SESMAN_LOG"
+fi
+
+systemctl enable fail2ban
+systemctl restart fail2ban
+
+
+# ----------------------------------------------------------
 # BROWSERS
 # ----------------------------------------------------------
 
 echo
-echo "[8/10] Installing browsers"
+echo "[10/12] Installing browsers"
 
 
 # ----------------------------------------------------------
 # GOOGLE CHROME
 #
 # Google's official Linux .deb is amd64 only.
-#
-# On other architectures try Chromium.
 # ----------------------------------------------------------
 
 if [[ "$ARCH" == "amd64" ]]; then
@@ -793,36 +1084,169 @@ fi
 
 
 # ----------------------------------------------------------
+# JDOWNLOADER (OPTIONAL)
+# ----------------------------------------------------------
+
+echo
+echo "[11/12] Installing optional components"
+
+JD_DIR="/opt/jdownloader"
+
+if [[ "$JD_MODE" != "none" ]]; then
+
+    echo "Installing JDownloader 2 ($JD_MODE mode)..."
+
+    # The desktop application needs the FULL JRE.
+    #
+    # openjdk-*-jre-headless has no windowing support, so
+    # JDownloader would silently fall back to headless mode
+    # even with a valid DISPLAY.
+
+    if [[ "$JD_MODE" == "desktop" ]]; then
+        JAVA_PKG="default-jre"
+    else
+        JAVA_PKG="default-jre-headless"
+    fi
+
+    if ! apt-get install -y "$JAVA_PKG"; then
+        echo "WARNING: Could not install $JAVA_PKG."
+        echo "Skipping JDownloader installation."
+        JD_MODE="none"
+    fi
+
+fi
+
+if [[ "$JD_MODE" != "none" ]]; then
+
+    mkdir -p "$JD_DIR"
+
+    if wget \
+        -qO "$JD_DIR/JDownloader.jar" \
+        "http://installer.jdownloader.org/JDownloader.jar"; then
+
+        chown -R "$USERNAME:$USER_GROUP" "$JD_DIR"
+
+        if [[ "$JD_MODE" == "service" ]]; then
+
+            cat > /etc/systemd/system/jdownloader.service <<EOF
+[Unit]
+Description=JDownloader 2 headless
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$USERNAME
+Group=$USER_GROUP
+WorkingDirectory=$JD_DIR
+ExecStart=/usr/bin/java -Djava.awt.headless=true -jar $JD_DIR/JDownloader.jar
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+            systemctl daemon-reload
+
+            # Deliberately NOT started here: the first run is
+            # interactive and asks for My JDownloader credentials.
+
+            systemctl enable jdownloader
+
+            echo "JDownloader service created (not started yet)."
+
+        else
+
+            cat > /usr/share/applications/jdownloader.desktop <<EOF
+[Desktop Entry]
+Type=Application
+Name=JDownloader 2
+Comment=Download Manager
+Exec=java -jar $JD_DIR/JDownloader.jar
+Path=$JD_DIR
+Terminal=false
+Categories=Network;FileTransfer;
+StartupNotify=true
+EOF
+
+            chmod 0644 /usr/share/applications/jdownloader.desktop
+            update-desktop-database 2>/dev/null || true
+
+            echo "JDownloader menu entry created."
+
+        fi
+
+    else
+
+        echo "WARNING: Failed to download JDownloader."
+        JD_MODE="none"
+
+    fi
+
+fi
+
+
+# ----------------------------------------------------------
+# SESSION RESET HELPER
+#
+# A stuck window manager can leave a session that refuses
+# new connections. This helper clears it from SSH.
+# ----------------------------------------------------------
+
+cat > /usr/local/bin/xrdp-session-reset <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "\$EUID" -ne 0 ]]; then
+    echo "Please run as root." >&2
+    exit 1
+fi
+
+echo "Terminating all processes of user '$USERNAME'..."
+
+pkill -u "$USERNAME" || true
+sleep 2
+
+systemctl restart xrdp-sesman
+systemctl restart xrdp
+
+echo "Done. Reconnect using <SERVER_IP>:$RDP_PORT"
+EOF
+
+chmod 0755 /usr/local/bin/xrdp-session-reset
+
+
+# ----------------------------------------------------------
 # VERIFY
 # ----------------------------------------------------------
 
 echo
-echo "[9/10] Verifying installation"
+echo "[12/12] Verifying installation"
 
 INSTALL_OK=true
 
 
 if systemctl is-active --quiet xrdp; then
-
     echo "XRDP:         active"
-
 else
-
     echo "XRDP:         FAILED"
     INSTALL_OK=false
-
 fi
 
 
 if systemctl is-active --quiet xrdp-sesman; then
-
     echo "XRDP sesman:  active"
-
 else
-
     echo "XRDP sesman:  FAILED"
     INSTALL_OK=false
+fi
 
+
+if systemctl is-active --quiet fail2ban; then
+    echo "fail2ban:     active"
+else
+    echo "fail2ban:     WARNING (not running)"
 fi
 
 
@@ -841,6 +1265,19 @@ if [[ "$INSTALL_OK" == false ]]; then
 fi
 
 
+# Confirm the listening port.
+
+if command -v ss >/dev/null 2>&1; then
+
+    if ss -tln | grep -q ":${RDP_PORT}\b"; then
+        echo "RDP port:     listening on $RDP_PORT"
+    else
+        echo "RDP port:     WARNING (nothing listening on $RDP_PORT yet)"
+    fi
+
+fi
+
+
 echo
 echo "Firewall status:"
 echo
@@ -853,32 +1290,70 @@ ufw status verbose
 # ----------------------------------------------------------
 
 echo
-echo "[10/10] Installation completed"
-echo
 echo "=================================================="
 echo " XRDP + XFCE installation finished"
 echo
 echo " OS:       ${PRETTY_NAME:-Ubuntu}"
 echo " Arch:     $ARCH"
 echo " RDP user: $USERNAME"
-echo " RDP port: 3389"
+echo " RDP port: $RDP_PORT"
 
 if [[ "$LIMIT_RDP" =~ ^[Yy]$ ]]; then
-
     echo " RDP IP:   $ALLOWED_IP"
-
 else
-
     echo " RDP IP:   ANY"
+fi
+
+echo
+echo " Connect using:"
+echo "   <SERVER_IP>:$RDP_PORT"
+echo
+echo " Sessions are persistent."
+echo " CLOSE the RDP window to keep applications running."
+echo " LOGGING OUT inside XFCE ends the session and closes"
+echo " everything in it."
+echo
+echo " AppImages are supported (FUSE 2 installed)."
+echo " Remember to make them executable:"
+echo "   chmod +x <file>.AppImage"
+echo
+echo " Useful commands:"
+echo "   fail2ban-client status sshd"
+echo "   fail2ban-client status xrdp"
+echo "   fail2ban-client set xrdp unbanip <IP>"
+echo "   xrdp-session-reset"
+
+if [[ "$JD_MODE" == "service" ]]; then
+
+    echo
+    echo " JDownloader (headless service)"
+    echo
+    echo " First run is interactive. As root, run:"
+    echo "   sudo -u $USERNAME java -jar $JD_DIR/JDownloader.jar"
+    echo
+    echo " Enter the My JDownloader credentials when asked,"
+    echo " wait until the device appears on my.jdownloader.org,"
+    echo " then press Ctrl+C and start the service:"
+    echo "   systemctl start jdownloader"
+
+elif [[ "$JD_MODE" == "desktop" ]]; then
+
+    echo
+    echo " JDownloader (desktop application)"
+    echo
+    echo " Available in the XFCE menu under Internet."
+    echo " The first start asks for My JDownloader credentials."
+
+fi
+
+if [[ ! "$LIMIT_RDP" =~ ^[Yy]$ ]]; then
     echo
     echo " WARNING: RDP is publicly accessible."
-
+    echo " fail2ban limits brute force attempts, but a long,"
+    echo " randomly generated password remains essential."
 fi
 
 echo
 echo " Recommended: reboot before the first RDP login."
-echo
-echo " Connect using:"
-echo "   <SERVER_IP>:3389"
 echo
 echo "=================================================="
