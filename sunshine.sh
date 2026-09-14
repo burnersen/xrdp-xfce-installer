@@ -1,144 +1,144 @@
 #!/usr/bin/env bash
 #
 # ==========================================================
-#  Sunshine auf einem Server ohne Bildschirm
-#  mit eigener, zweiter Arbeitsflaeche
+#  Sunshine on a server without a screen,
+#  with a second desktop of its own
 #
-#  Ubuntu 20.04 und neuer
+#  Ubuntu 20.04 and newer
 # ==========================================================
 #
-#  WAS DAS SKRIPT BAUT
+#  WHAT THIS SCRIPT BUILDS
 #
-#    sunshine-xorg.service      Xorg (dummy) :20   der Bildschirm
-#      +- sunshine-desktop.service   XFCE darauf
-#           +- sunshine-stream.service   Sunshine streamt ihn
+#    sunshine-xorg.service      Xorg (dummy) :20   the screen
+#      +- sunshine-desktop.service   XFCE on it
+#           +- sunshine-stream.service   Sunshine streaming it
 #
-#  Dazu eine virtuelle Tonausgabe ueber PipeWire, weil der
-#  Server keine Soundkarte hat und der Stream sonst stumm bliebe.
+#  Plus a virtual audio output over PipeWire, because the
+#  server has no sound card and the stream would be silent.
 #
-#  Der RDP-Zugang bleibt unberuehrt. Es entsteht eine ZWEITE
-#  Arbeitsflaeche neben der von RDP: gleiche Dateien, aber
-#  getrennt laufende Programme.
+#  The RDP setup is not touched. A SECOND desktop appears
+#  next to the one reached over RDP: same files, but separate
+#  running applications.
 #
-#  WARUM XORG UND NICHT XVFB
+#  WHY XORG AND NOT XVFB
 #
-#  Xvfb nimmt keine Eingabegeraete an. Sunshine legt Maus und
-#  Tastatur erst beim Verbinden als virtuelle uinput-Geraete
-#  an - unter Xvfb laufen die ins Leere. Ergebnis waere: Bild
-#  kommt an, nichts laesst sich bedienen. Xorg mit dem Treiber
-#  "dummy" ist ein vollwertiger X-Server ohne Grafikkarte und
-#  erkennt neue Eingabegeraete ueber udev.
+#  Xvfb accepts no input devices. Sunshine creates its mouse
+#  and keyboard as virtual uinput devices the moment a client
+#  connects - under Xvfb those are discarded. The result would
+#  be: the picture arrives, nothing can be operated. Xorg with
+#  the "dummy" driver is a full X server without a graphics
+#  card and picks up new input devices through udev.
 #
-#  WICHTIG FUER DEN CLIENT (sonst bewegt sich die Maus nicht!)
+#  IMPORTANT ON THE CLIENT (or the mouse will not move!)
 #
-#  In Moonlight muss "Maus fuer Remotedesktop optimieren"
-#  AUSGESCHALTET sein. Mit dieser Einstellung sendet Moonlight
-#  absolute Positionen, die bei Sunshine nicht ankommen.
-#  Der Hinweis steht am Ende noch einmal.
+#  In Moonlight, "optimize mouse for remote desktop" has to be
+#  switched OFF. With that setting Moonlight sends absolute
+#  positions, which never arrive at Sunshine.
+#  The note is repeated at the end.
 #
-#  WAS NICHT ANGEFASST WIRD
+#  WHAT IS NOT TOUCHED
 #
 #    /etc/xrdp/ ... , /etc/X11/xorg.conf , /etc/X11/xorg.conf.d/
 #
-#  Von jeder Datei, die veraendert wird, liegt vorher eine
-#  Sicherungskopie in /root/setup-backup.
+#  Every file that is modified is backed up beforehand into
+#  /root/setup-backup.
 # ==========================================================
 
 set -Eeuo pipefail
 
 
 # ----------------------------------------------------------
-# KONSTANTEN
+# CONSTANTS
 # ----------------------------------------------------------
 
-readonly SICHERUNG_ORDNER="/root/setup-backup"
-readonly XORG_KONFIG="/etc/X11/xorg-dummy.conf"
-readonly XWRAPPER_KONFIG="/etc/X11/Xwrapper.config"
-readonly UINPUT_MODUL_KONFIG="/etc/modules-load.d/uinput.conf"
-readonly DIENST_ORDNER="/etc/systemd/system"
+readonly BACKUP_DIR="/root/setup-backup"
+readonly XORG_CONFIG="/etc/X11/xorg-dummy.conf"
+readonly XWRAPPER_CONFIG="/etc/X11/Xwrapper.config"
+readonly UINPUT_MODULE_CONFIG="/etc/modules-load.d/uinput.conf"
+readonly SERVICE_DIR="/etc/systemd/system"
 
-# Anzeigen unter :20 gehoeren den RDP-Sitzungen (die zaehlen ab :10 hoch).
-readonly KLEINSTE_ANZEIGE=20
-readonly GROESSTE_ANZEIGE=99
+# Displays below :20 belong to the RDP sessions (those count up from :10).
+readonly MIN_DISPLAY=20
+readonly MAX_DISPLAY=99
 
-# Wie lange auf einen startenden X-Server gewartet wird.
-readonly WARTEN_MAX_SEKUNDEN=40
+# How long to wait for a starting X server.
+readonly WAIT_MAX_SECONDS=40
 
-# Name der virtuellen Tonausgabe. Der Server hat keine Soundkarte;
-# ohne dieses Geraet bliebe der Stream stumm.
-readonly TON_GERAET="sunshine_sink"
+# Name of the virtual audio output. The server has no sound card;
+# without this device the stream would be silent.
+readonly AUDIO_SINK="sunshine_sink"
 
-# Ordner fuer die getrennten Profile der Zweitstarter.
-# BEWUSST OHNE PUNKT am Anfang: Programme aus einem Snap-Paket (unter
-# Ubuntu z. B. Firefox) duerfen versteckte Ordner im Heimatverzeichnis
-# nicht lesen. Mit einem Punkt davor wuerde der Firefox-Starter scheitern.
-readonly ZWEITPROFIL_ORDNER_NAME="sunshine-zweitprofile"
+# Directory for the separate profiles of the second-session launchers.
+# DELIBERATELY WITHOUT A LEADING DOT: applications from a Snap package
+# (on Ubuntu for example Firefox) may not read hidden directories in the
+# home directory. With a dot in front, the Firefox launcher would fail.
+readonly PROFILE_DIR_NAME="sunshine-profiles"
 
 
 # ----------------------------------------------------------
-# FEHLERBEHANDLUNG
+# ERROR HANDLING
 # ----------------------------------------------------------
 
-bei_fehler() {
-    local rueckgabewert=$?
+on_error() {
+    local exit_code=$?
 
-    # Schlaegt ein Befehl in einer Kommandosubstitution fehl, laeuft dieser
-    # Trap zweimal (Unterschale + Hauptlauf). Die Unterschale meldet nichts.
+    # If a command inside a command substitution fails, this trap runs
+    # twice (subshell + main run). The subshell reports nothing.
     if [[ "$BASHPID" != "$$" ]]; then
-        exit "$rueckgabewert"
+        exit "$exit_code"
     fi
 
     echo >&2
     echo "==================================================" >&2
-    echo " ABBRUCH: Die Einrichtung ist fehlgeschlagen." >&2
-    echo " Zeile:   $1" >&2
-    echo " Befehl:  $2" >&2
-    echo " Code:    $rueckgabewert" >&2
+    echo " ABORTED: the setup failed." >&2
+    echo " Line:    $1" >&2
+    echo " Command: $2" >&2
+    echo " Code:    $exit_code" >&2
     echo >&2
-    echo " Sicherungskopien liegen in $SICHERUNG_ORDNER" >&2
+    echo " Backups are in $BACKUP_DIR" >&2
     echo "==================================================" >&2
 
-    exit "$rueckgabewert"
+    exit "$exit_code"
 }
 
-trap 'bei_fehler "$LINENO" "$BASH_COMMAND"' ERR
+trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 
 
 # ----------------------------------------------------------
-# KLEINE HELFER
+# SMALL HELPERS
 # ----------------------------------------------------------
 
-schritt() {
+step() {
     echo
     echo "=== $* ==="
 }
 
-hinweis() {
+note() {
     echo "    $*"
 }
 
-warnung() {
-    echo "    ACHTUNG: $*"
+warn() {
+    echo "    NOTE: $*"
 }
 
-sichern() {
-    local datei="$1"
+backup_file() {
+    local path="$1"
 
-    if [[ ! -f "$datei" ]]; then
+    if [[ ! -f "$path" ]]; then
         return 0
     fi
 
-    cp -a "$datei" "$SICHERUNG_ORDNER/$(basename "$datei").$ZEITSTEMPEL"
-    hinweis "Sicherung: $(basename "$datei").$ZEITSTEMPEL"
+    cp -a "$path" "$BACKUP_DIR/$(basename "$path").$TIMESTAMP"
+    note "Backup: $(basename "$path").$TIMESTAMP"
 }
 
-# Wartet, bis der X-Server auf der Anzeige antwortet.
-warte_auf_bildschirm() {
-    local sekunde
+# Waits until the X server on the display answers.
+wait_for_screen() {
+    local second
 
-    for (( sekunde = 1; sekunde <= WARTEN_MAX_SEKUNDEN; sekunde++ )); do
+    for (( second = 1; second <= WAIT_MAX_SECONDS; second++ )); do
 
-        if DISPLAY=":$ANZEIGE_NUMMER" xdpyinfo >/dev/null 2>&1; then
+        if DISPLAY=":$DISPLAY_NUM" xdpyinfo >/dev/null 2>&1; then
             echo
             return 0
         fi
@@ -154,21 +154,21 @@ warte_auf_bildschirm() {
 
 
 # ----------------------------------------------------------
-# VORPRUEFUNGEN
+# PRE-FLIGHT CHECKS
 # ----------------------------------------------------------
 
 if [[ "$EUID" -ne 0 ]]; then
-    echo "FEHLER: Bitte als root ausfuehren (sudo -i)." >&2
+    echo "ERROR: Please run as root (sudo -i)." >&2
     exit 1
 fi
 
 if ! true </dev/tty 2>/dev/null; then
-    echo "FEHLER: Das Skript stellt Fragen und braucht ein Terminal." >&2
+    echo "ERROR: The script asks questions and needs a terminal." >&2
     exit 1
 fi
 
 if [[ ! -r /etc/os-release ]]; then
-    echo "FEHLER: /etc/os-release nicht gefunden." >&2
+    echo "ERROR: /etc/os-release not found." >&2
     exit 1
 fi
 
@@ -176,190 +176,190 @@ fi
 source /etc/os-release
 
 if [[ "${ID:-}" != "ubuntu" ]]; then
-    echo "FEHLER: Dieses Skript ist fuer Ubuntu gedacht." >&2
+    echo "ERROR: This script is written for Ubuntu." >&2
     exit 1
 fi
 
-# Ohne XFCE gibt es nichts zu uebertragen. Lieber hier abbrechen als
-# nach der halben Installation.
+# Without XFCE there is nothing to stream. Better to stop here than
+# halfway through the installation.
 if [[ ! -x /usr/bin/xfce4-session ]]; then
-    echo "FEHLER: /usr/bin/xfce4-session nicht gefunden." >&2
-    echo "Dieses Skript setzt eine vorhandene XFCE-Arbeitsflaeche voraus." >&2
-    echo "Nachinstallieren mit:  apt-get install -y xfce4" >&2
+    echo "ERROR: /usr/bin/xfce4-session not found." >&2
+    echo "This script requires an existing XFCE desktop." >&2
+    echo "Install it with:  apt-get install -y xfce4" >&2
     exit 1
 fi
 
-ZEITSTEMPEL="$(date +%Y%m%d_%H%M%S)"
-readonly ZEITSTEMPEL
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+readonly TIMESTAMP
 
 echo "=================================================="
-echo " Sunshine mit eigener Arbeitsflaeche einrichten"
+echo " Set up Sunshine with a desktop of its own"
 echo "=================================================="
 echo
-echo " System:     ${PRETTY_NAME:-Ubuntu}"
-echo " Architektur: $(dpkg --print-architecture)"
+echo " System:       ${PRETTY_NAME:-Ubuntu}"
+echo " Architecture: $(dpkg --print-architecture)"
 echo
-echo " Es entsteht eine ZWEITE Arbeitsflaeche neben der von"
-echo " RDP. Dateien sind dieselben, die laufenden Programme"
-echo " nicht. An der RDP-Einrichtung wird nichts geaendert."
+echo " A SECOND desktop is created next to the one reached"
+echo " over RDP. The files are the same, the running"
+echo " applications are not. The RDP setup is not changed."
 echo
 
 if [[ ! -d /dev/dri ]]; then
-    echo " Hinweis: keine Grafikkarte gefunden. Das Bild wird vom"
-    echo " Hauptprozessor berechnet. Fuer Arbeitsflaeche und Video"
-    echo " reicht das, zum Spielen nicht."
+    echo " Note: no graphics card found. The picture is encoded"
+    echo " by the processor. That is fine for a desktop and for"
+    echo " video, but not for gaming."
     echo
 fi
 
 
 # ----------------------------------------------------------
-# FRAGEN
+# QUESTIONS
 # ----------------------------------------------------------
 
-read -rp "Benutzer, dem die Sunshine-Arbeitsflaeche gehoert: " \
-    BENUTZER < /dev/tty
+read -rp "User the Sunshine desktop belongs to: " \
+    USERNAME < /dev/tty
 
-if [[ -z "$BENUTZER" ]]; then
-    echo "FEHLER: Kein Benutzer angegeben." >&2
+if [[ -z "$USERNAME" ]]; then
+    echo "ERROR: No user given." >&2
     exit 1
 fi
 
-if ! id "$BENUTZER" >/dev/null 2>&1; then
-    echo "FEHLER: Benutzer '$BENUTZER' gibt es nicht." >&2
+if ! id "$USERNAME" >/dev/null 2>&1; then
+    echo "ERROR: User '$USERNAME' does not exist." >&2
     exit 1
 fi
 
-BENUTZER_UID="$(id -u "$BENUTZER")"
+USER_UID="$(id -u "$USERNAME")"
 
-if (( BENUTZER_UID < 1000 )); then
-    echo "FEHLER: '$BENUTZER' ist ein Systemkonto (UID $BENUTZER_UID)." >&2
+if (( USER_UID < 1000 )); then
+    echo "ERROR: '$USERNAME' is a system account (UID $USER_UID)." >&2
     exit 1
 fi
 
-BENUTZER_GRUPPE="$(id -gn "$BENUTZER")"
-BENUTZER_HEIM="$(getent passwd "$BENUTZER" | cut -d: -f6)"
+USER_GROUP="$(id -gn "$USERNAME")"
+USER_HOME="$(getent passwd "$USERNAME" | cut -d: -f6)"
 
-if [[ -z "$BENUTZER_HEIM" || ! -d "$BENUTZER_HEIM" ]]; then
-    echo "FEHLER: Heimatverzeichnis von '$BENUTZER' nicht gefunden." >&2
+if [[ -z "$USER_HOME" || ! -d "$USER_HOME" ]]; then
+    echo "ERROR: Home directory of '$USERNAME' not found." >&2
     exit 1
 fi
 
-readonly BENUTZER BENUTZER_UID BENUTZER_GRUPPE BENUTZER_HEIM
+readonly USERNAME USER_UID USER_GROUP USER_HOME
 
 echo
 
-read -rp "Nummer der Anzeige [$KLEINSTE_ANZEIGE]: " \
-    ANZEIGE_NUMMER < /dev/tty
+read -rp "Display number [$MIN_DISPLAY]: " \
+    DISPLAY_NUM < /dev/tty
 
-ANZEIGE_NUMMER="${ANZEIGE_NUMMER:-$KLEINSTE_ANZEIGE}"
+DISPLAY_NUM="${DISPLAY_NUM:-$MIN_DISPLAY}"
 
-if ! [[ "$ANZEIGE_NUMMER" =~ ^[0-9]+$ ]]; then
-    echo "FEHLER: Bitte eine Zahl angeben." >&2
+if ! [[ "$DISPLAY_NUM" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: Please enter a number." >&2
     exit 1
 fi
 
-if (( ANZEIGE_NUMMER < KLEINSTE_ANZEIGE || ANZEIGE_NUMMER > GROESSTE_ANZEIGE )); then
-    echo "FEHLER: Bitte eine Zahl zwischen $KLEINSTE_ANZEIGE und $GROESSTE_ANZEIGE." >&2
-    echo "Kleinere Nummern gehoeren den RDP-Sitzungen." >&2
+if (( DISPLAY_NUM < MIN_DISPLAY || DISPLAY_NUM > MAX_DISPLAY )); then
+    echo "ERROR: Please use a number between $MIN_DISPLAY and $MAX_DISPLAY." >&2
+    echo "Lower numbers belong to the RDP sessions." >&2
     exit 1
 fi
 
-if [[ -e "/tmp/.X11-unix/X${ANZEIGE_NUMMER}" ]]; then
-    echo "FEHLER: Anzeige :$ANZEIGE_NUMMER ist schon belegt." >&2
+if [[ -e "/tmp/.X11-unix/X${DISPLAY_NUM}" ]]; then
+    echo "ERROR: Display :$DISPLAY_NUM is already in use." >&2
     exit 1
 fi
 
-readonly ANZEIGE_NUMMER
+readonly DISPLAY_NUM
 
 echo
 
-read -rp "Aufloesung [1920x1080]: " AUFLOESUNG < /dev/tty
+read -rp "Resolution [1920x1080]: " RESOLUTION < /dev/tty
 
-AUFLOESUNG="${AUFLOESUNG:-1920x1080}"
+RESOLUTION="${RESOLUTION:-1920x1080}"
 
-if ! [[ "$AUFLOESUNG" =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]]; then
-    echo "FEHLER: Ungueltige Aufloesung. Beispiel: 1920x1080" >&2
+if ! [[ "$RESOLUTION" =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]]; then
+    echo "ERROR: Invalid resolution. Example: 1920x1080" >&2
     exit 1
 fi
 
-BILD_BREITE="${AUFLOESUNG%x*}"
-BILD_HOEHE="${AUFLOESUNG#*x}"
+SCREEN_WIDTH="${RESOLUTION%x*}"
+SCREEN_HEIGHT="${RESOLUTION#*x}"
 
-readonly AUFLOESUNG BILD_BREITE BILD_HOEHE
+readonly RESOLUTION SCREEN_WIDTH SCREEN_HEIGHT
 
 echo
 
-read -rp "Zugriff auf eine einzelne IPv4-Adresse beschraenken? [J/n]: " \
-    ANTWORT_FIREWALL < /dev/tty
+read -rp "Restrict access to a single IPv4 address? [Y/n]: " \
+    ANSWER_FIREWALL < /dev/tty
 
-ANTWORT_FIREWALL="${ANTWORT_FIREWALL:-J}"
+ANSWER_FIREWALL="${ANSWER_FIREWALL:-J}"
 
-ERLAUBTE_IP=""
+ALLOWED_IP=""
 
-if [[ "$ANTWORT_FIREWALL" =~ ^[JjYy]$ ]]; then
+if [[ "$ANSWER_FIREWALL" =~ ^[JjYy]$ ]]; then
 
     while true; do
 
-        read -rp "Erlaubte oeffentliche IPv4-Adresse: " \
-            ERLAUBTE_IP < /dev/tty
+        read -rp "Allowed public IPv4 address: " \
+            ALLOWED_IP < /dev/tty
 
-        if [[ "$ERLAUBTE_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+        if [[ "$ALLOWED_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
             break
         fi
 
-        echo "Ungueltig. Beispiel: 203.0.113.10"
+        echo "Invalid. Example: 203.0.113.10"
 
     done
 
-elif ! [[ "$ANTWORT_FIREWALL" =~ ^[Nn]$ ]]; then
+elif ! [[ "$ANSWER_FIREWALL" =~ ^[Nn]$ ]]; then
 
-    echo "FEHLER: Bitte j oder n antworten." >&2
+    echo "ERROR: Please answer y or n." >&2
     exit 1
 
 fi
 
-readonly ERLAUBTE_IP
+readonly ALLOWED_IP
 
 echo
-echo "Manche Programme (Browser, Mailprogramm) laufen je Benutzer nur"
-echo "EINMAL. Sind sie schon auf der RDP-Flaeche offen, tut sich hier"
-echo "beim Start nichts. Dagegen koennen eigene Starter mit getrenntem"
-echo "Profil angelegt werden."
+echo "Some applications (browsers, mail clients) run only ONCE"
+echo "per user. If one is already open on the RDP desktop,"
+echo "starting it here does nothing. Separate launchers with"
+echo "their own profile can be created to work around that."
 echo
 
-read -rp "Solche Zweitstarter anlegen? [J/n]: " \
-    ANTWORT_STARTER < /dev/tty
+read -rp "Create such second-session launchers? [Y/n]: " \
+    ANSWER_LAUNCHERS < /dev/tty
 
-ANTWORT_STARTER="${ANTWORT_STARTER:-J}"
+ANSWER_LAUNCHERS="${ANSWER_LAUNCHERS:-J}"
 
-if [[ "$ANTWORT_STARTER" =~ ^[JjYy]$ ]]; then
-    STARTER_ANLEGEN=true
-elif [[ "$ANTWORT_STARTER" =~ ^[Nn]$ ]]; then
-    STARTER_ANLEGEN=false
+if [[ "$ANSWER_LAUNCHERS" =~ ^[JjYy]$ ]]; then
+    CREATE_LAUNCHERS=true
+elif [[ "$ANSWER_LAUNCHERS" =~ ^[Nn]$ ]]; then
+    CREATE_LAUNCHERS=false
 else
-    echo "FEHLER: Bitte j oder n antworten." >&2
+    echo "ERROR: Please answer y or n." >&2
     exit 1
 fi
 
-readonly STARTER_ANLEGEN
+readonly CREATE_LAUNCHERS
 
-mkdir -p "$SICHERUNG_ORDNER"
+mkdir -p "$BACKUP_DIR"
 
 
 # ----------------------------------------------------------
-# 1 - PAKETE
+# 1 - PACKAGES
 # ----------------------------------------------------------
 
-schritt "[1/10] Pakete installieren"
+step "[1/10] Installing packages"
 
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
 
-# xserver-xorg-video-dummy  der Bildschirm ohne Grafikkarte
-# xserver-xorg-input-libinput  damit Eingabegeraete angenommen werden
-# x11-utils / xinput  fuer die Pruefungen am Ende
-# python3-evdev  erzeugt das Testgeraet fuer die Abnahme
+# xserver-xorg-video-dummy     the screen without a graphics card
+# xserver-xorg-input-libinput  so input devices are accepted
+# x11-utils / xinput           for the checks at the end
+# python3-evdev                creates the test device for the acceptance check
 apt-get install -y \
     xserver-xorg-core \
     xserver-xorg-video-dummy \
@@ -376,16 +376,16 @@ apt-get install -y \
 # ----------------------------------------------------------
 # 2 - SUNSHINE
 #
-# Ueber die Paketquelle des Herstellers statt per fester
-# Download-Adresse: Dateinamen enthalten die Versionsnummer
-# und wuerden mit der naechsten Ausgabe nicht mehr stimmen.
+# The vendor's package repository is used instead of a fixed
+# download URL: release file names contain the version and
+# would break with the next release.
 # ----------------------------------------------------------
 
-schritt "[2/10] Sunshine installieren"
+step "[2/10] Installing Sunshine"
 
 if command -v sunshine >/dev/null 2>&1; then
 
-    hinweis "Sunshine ist schon installiert."
+    note "Sunshine is already installed."
 
 else
 
@@ -398,102 +398,101 @@ else
 
 fi
 
-# Der mitgelieferte Benutzerdienst wuerde sich irgendeinen Bildschirm
-# suchen. Hier laufen eigene Dienste, also den mitgelieferten abschalten.
+# The bundled user service would look for whichever display it can
+# find. This setup uses its own services, so disable the bundled one.
 systemctl --global disable \
     app-dev.lizardbyte.app.Sunshine.service >/dev/null 2>&1 || true
 
 
 # ----------------------------------------------------------
-# 3 - EINGABEGERAETE
+# 3 - INPUT DEVICES
 #
-# Ohne das Modul uinput gibt es kein /dev/uinput, und ohne das
-# kann Sunshine keine virtuelle Maus anlegen. Der Eintrag in
-# modules-load.d sorgt dafuer, dass es den Neustart uebersteht.
+# Without the uinput module there is no /dev/uinput, and without
+# that Sunshine cannot create a virtual mouse. The entry in
+# modules-load.d makes sure it survives a reboot.
 # ----------------------------------------------------------
 
-schritt "[3/10] Eingabegeraete vorbereiten"
+step "[3/10] Preparing input devices"
 
 modprobe uinput 2>/dev/null || true
 
-echo uinput > "$UINPUT_MODUL_KONFIG"
+echo uinput > "$UINPUT_MODULE_CONFIG"
 
 if [[ ! -e /dev/uinput ]]; then
-    echo "FEHLER: /dev/uinput fehlt. Ohne das geht keine Eingabe." >&2
-    echo "Erlaubt der Anbieter dieser Maschine eigene Kernelmodule?" >&2
+    echo "ERROR: /dev/uinput is missing. Without it there is no input." >&2
+    echo "Does this machine's provider allow custom kernel modules?" >&2
     exit 1
 fi
 
-hinweis "$(ls -l /dev/uinput)"
+note "$(ls -l /dev/uinput)"
 
 if getent group input >/dev/null 2>&1; then
 
-    if [[ " $(id -nG "$BENUTZER") " == *" input "* ]]; then
-        hinweis "$BENUTZER ist in der Gruppe input."
+    if [[ " $(id -nG "$USERNAME") " == *" input "* ]]; then
+        note "$USERNAME is in the input group."
     else
-        usermod -aG input "$BENUTZER"
-        hinweis "$BENUTZER zur Gruppe input hinzugefuegt."
+        usermod -aG input "$USERNAME"
+        note "$USERNAME added to the input group."
     fi
 
 fi
 
 
 # ----------------------------------------------------------
-# 4 - BILDSCHIRM-KONFIGURATION
+# 4 - SCREEN CONFIGURATION
 #
-# Eigener Dateiname mit Absicht: diese Datei liest nur der
-# eigene Xorg-Aufruf. Eine Datei namens xorg.conf oder ein
-# Schnipsel in xorg.conf.d wuerde auch von den xrdp-Sitzungen
-# gelesen und koennte den RDP-Zugang zerstoeren.
+# A dedicated file name on purpose: only this script's own Xorg
+# call reads this file. A file called xorg.conf, or a snippet in
+# xorg.conf.d, would also be read by the xrdp sessions and could
+# break RDP access.
 # ----------------------------------------------------------
 
-schritt "[4/10] Bildschirm einrichten"
+step "[4/10] Setting up the screen"
 
-sichern "$XORG_KONFIG"
+backup_file "$XORG_CONFIG"
 
-# Die Zeitwerte einer Bildschirmzeile ("Modeline") haengen von der
-# Aufloesung ab. Ein fester Wert waere nur fuer 1920x1080 richtig und
-# wuerde bei jeder anderen Angabe ein falsches Bild ergeben, deshalb
-# wird sie mit cvt passend berechnet.
-MODELINE_ZEILE=""
-MODUS_NAME="${BILD_BREITE}x${BILD_HOEHE}"
+# The timings of a modeline depend on the resolution. A fixed value
+# would only be correct for 1920x1080 and would produce a wrong
+# picture for any other size, so cvt calculates a matching one.
+MODELINE=""
+MODE_NAME="${SCREEN_WIDTH}x${SCREEN_HEIGHT}"
 
 if command -v cvt >/dev/null 2>&1; then
-    MODELINE_ZEILE="$(cvt "$BILD_BREITE" "$BILD_HOEHE" 60 \
+    MODELINE="$(cvt "$SCREEN_WIDTH" "$SCREEN_HEIGHT" 60 \
         | grep '^Modeline' || true)"
 fi
 
-if [[ -n "$MODELINE_ZEILE" ]]; then
+if [[ -n "$MODELINE" ]]; then
 
-    # cvt nennt den Modus z. B. "1920x1080_60.00" - genau dieser Name
-    # muss unten bei "Modes" wieder auftauchen.
-    MODUS_NAME="$(awk '{ gsub(/"/, "", $2); print $2 }' <<< "$MODELINE_ZEILE")"
-    hinweis "Bildschirmzeile berechnet: $MODUS_NAME"
+    # cvt names the mode for example "1920x1080_60.00" - that exact
+    # name has to appear again below under "Modes".
+    MODE_NAME="$(awk '{ gsub(/"/, "", $2); print $2 }' <<< "$MODELINE")"
+    note "Modeline calculated: $MODE_NAME"
 
 else
 
-    # Rueckfallebene, falls cvt fehlt: Standardwerte fuer 1920x1080.
-    MODELINE_ZEILE='Modeline "1920x1080" 148.50 1920 2008 2052 2200 1080 1084 1089 1125 +hsync +vsync'
-    MODUS_NAME="1920x1080"
-    warnung "cvt nicht gefunden - es wird 1920x1080 verwendet."
+    # Fallback if cvt is missing: standard values for 1920x1080.
+    MODELINE='Modeline "1920x1080" 148.50 1920 2008 2052 2200 1080 1084 1089 1125 +hsync +vsync'
+    MODE_NAME="1920x1080"
+    warn "cvt not found - falling back to 1920x1080."
 
 fi
 
-readonly MODELINE_ZEILE MODUS_NAME
+readonly MODELINE MODE_NAME
 
-cat > "$XORG_KONFIG" <<EOF
-# Virtueller Bildschirm fuer Sunshine auf Anzeige :$ANZEIGE_NUMMER.
-# Angelegt am $(date '+%d.%m.%Y %H:%M').
+cat > "$XORG_CONFIG" <<EOF
+# Virtual screen for Sunshine on display :$DISPLAY_NUM.
+# Created on $(date '+%Y-%m-%d %H:%M').
 #
-# Diese Datei liest NUR der eigene Xorg-Aufruf
-# (-config $(basename "$XORG_KONFIG")).
-# Sie darf NICHT xorg.conf heissen und NICHT in xorg.conf.d liegen.
+# This file is read ONLY by this setup's own Xorg call
+# (-config $(basename "$XORG_CONFIG")).
+# It must NOT be named xorg.conf and must NOT live in xorg.conf.d.
 
 Section "ServerFlags"
-    # MUSS "true" bleiben. Sunshine legt Maus und Tastatur erst beim
-    # Verbinden als uinput-Geraete an. Mit "false" - wie es in vielen
-    # Anleitungen steht - werden sie verworfen und nichts laesst sich
-    # bedienen.
+    # MUST stay "true". Sunshine creates mouse and keyboard as uinput
+    # devices only when a client connects. With "false" - as many
+    # headless guides recommend - they are discarded and nothing can
+    # be operated.
     Option "AutoAddDevices" "true"
 EndSection
 
@@ -507,7 +506,7 @@ Section "Monitor"
     Identifier  "DummyMonitor"
     HorizSync   5.0 - 1000.0
     VertRefresh 5.0 - 200.0
-    $MODELINE_ZEILE
+    $MODELINE
 EndSection
 
 Section "Screen"
@@ -517,8 +516,8 @@ Section "Screen"
     DefaultDepth 24
     SubSection "Display"
         Depth   24
-        Modes   "$MODUS_NAME"
-        Virtual $BILD_BREITE $BILD_HOEHE
+        Modes   "$MODE_NAME"
+        Virtual $SCREEN_WIDTH $SCREEN_HEIGHT
     EndSubSection
 EndSection
 
@@ -528,61 +527,60 @@ Section "ServerLayout"
 EndSection
 EOF
 
-# Gegenprobe auf Vollstaendigkeit. Eine halb geschriebene Datei faellt
-# sonst erst auf, wenn der Bildschirm merkwuerdig aussieht.
-ANZAHL_SECTION="$(grep -c '^Section' "$XORG_KONFIG" || true)"
-ANZAHL_ENDSECTION="$(grep -c '^EndSection' "$XORG_KONFIG" || true)"
+# Verify the file is complete. A half written file would otherwise
+# only show up once the screen looks odd.
+SECTION_COUNT="$(grep -c '^Section' "$XORG_CONFIG" || true)"
+ENDSECTION_COUNT="$(grep -c '^EndSection' "$XORG_CONFIG" || true)"
 
-if (( ANZAHL_SECTION != 5 || ANZAHL_ENDSECTION != 5 )); then
-    echo "FEHLER: $XORG_KONFIG ist unvollstaendig" >&2
-    echo "(Section: $ANZAHL_SECTION, EndSection: $ANZAHL_ENDSECTION, erwartet je 5)." >&2
+if (( SECTION_COUNT != 5 || ENDSECTION_COUNT != 5 )); then
+    echo "ERROR: $XORG_CONFIG is incomplete" >&2
+    echo "(Section: $SECTION_COUNT, EndSection: $ENDSECTION_COUNT, expected 5 each)." >&2
     exit 1
 fi
 
-hinweis "$XORG_KONFIG geschrieben und geprueft."
+note "$XORG_CONFIG written and verified."
 
-# Ohne allowed_users=anybody darf ein Dienstbenutzer keinen X-Server
-# starten. Nur diese eine Zeile wird angefasst - die Datei kann weitere
-# Eintraege enthalten, die xrdp braucht.
-sichern "$XWRAPPER_KONFIG"
+# Without allowed_users=anybody a service user may not start an X
+# server. Only this single line is touched - the file can contain
+# further entries that xrdp needs.
+backup_file "$XWRAPPER_CONFIG"
 
-if [[ ! -f "$XWRAPPER_KONFIG" ]]; then
+if [[ ! -f "$XWRAPPER_CONFIG" ]]; then
 
-    printf 'allowed_users=anybody\n' > "$XWRAPPER_KONFIG"
-    hinweis "$XWRAPPER_KONFIG angelegt."
+    printf 'allowed_users=anybody\n' > "$XWRAPPER_CONFIG"
+    note "$XWRAPPER_CONFIG created."
 
-elif grep -q '^allowed_users=anybody' "$XWRAPPER_KONFIG"; then
+elif grep -q '^allowed_users=anybody' "$XWRAPPER_CONFIG"; then
 
-    hinweis "Start-Erlaubnis steht schon richtig."
+    note "Start permission is already correct."
 
-elif grep -q '^allowed_users=' "$XWRAPPER_KONFIG"; then
+elif grep -q '^allowed_users=' "$XWRAPPER_CONFIG"; then
 
-    sed -i 's/^allowed_users=.*/allowed_users=anybody/' "$XWRAPPER_KONFIG"
-    hinweis "Start-Erlaubnis auf 'anybody' geaendert."
+    sed -i 's/^allowed_users=.*/allowed_users=anybody/' "$XWRAPPER_CONFIG"
+    note "Start permission changed to 'anybody'."
 
 else
 
-    printf 'allowed_users=anybody\n' >> "$XWRAPPER_KONFIG"
-    hinweis "Start-Erlaubnis ergaenzt."
+    printf 'allowed_users=anybody\n' >> "$XWRAPPER_CONFIG"
+    note "Start permission added."
 
 fi
 
 
 # ----------------------------------------------------------
-# 5 - TON
+# 5 - AUDIO
 #
-# Der Server hat keine Soundkarte. Ohne Tonsystem und ohne ein
-# Ausgabegeraet haetten Programme nichts, wohin sie ausgeben
-# koennen, und Sunshine nichts aufzunehmen - der Stream waere
-# stumm.
+# The server has no sound card. Without an audio system and
+# without an output device, applications would have nowhere to
+# play to and Sunshine nothing to capture - the stream would be
+# silent.
 #
-# PipeWire liefert beides: das Tonsystem und eine virtuelle
-# Ausgabe. Weil sie das einzige Ausgabegeraet ist, wird sie von
-# allein zur Standardausgabe; Programme finden sie also ohne
-# weiteres Zutun.
+# PipeWire provides both: the audio system and a virtual output.
+# Because it is the only output device, it becomes the default
+# on its own; applications find it without further setup.
 # ----------------------------------------------------------
 
-schritt "[5/10] Ton einrichten"
+step "[5/10] Setting up audio"
 
 apt-get install -y \
     pipewire \
@@ -590,33 +588,33 @@ apt-get install -y \
     wireplumber \
     pulseaudio-utils
 
-# systemctl und pactl im Namen des Benutzers aufrufen. Beide brauchen
-# dessen Laufzeitverzeichnis, sonst finden sie seine Dienste nicht.
+# Call systemctl and pactl on behalf of the user. Both need that
+# user's runtime directory, or they will not find their services.
 #
-# runuser statt sudo: es gehoert zu util-linux und ist auf jedem System
-# vorhanden, waehrend sudo ein eigenes Paket ist.
-als_benutzer() {
-    runuser -u "$BENUTZER" -- env \
-        XDG_RUNTIME_DIR="/run/user/$BENUTZER_UID" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$BENUTZER_UID/bus" \
+# runuser instead of sudo: it belongs to util-linux and is present on
+# every system, while sudo is a separate package.
+as_user() {
+    runuser -u "$USERNAME" -- env \
+        XDG_RUNTIME_DIR="/run/user/$USER_UID" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" \
         "$@"
 }
 
-# Die virtuelle Ausgabe dauerhaft anlegen. Ein "pactl load-module" waere
-# nach dem naechsten Neustart wieder verschwunden.
-PIPEWIRE_KONFIG_ORDNER="$BENUTZER_HEIM/.config/pipewire/pipewire.conf.d"
+# Create the virtual output permanently. A "pactl load-module" would
+# be gone again after the next reboot.
+PIPEWIRE_CONFIG_DIR="$USER_HOME/.config/pipewire/pipewire.conf.d"
 
-mkdir -p "$PIPEWIRE_KONFIG_ORDNER"
+mkdir -p "$PIPEWIRE_CONFIG_DIR"
 
-cat > "$PIPEWIRE_KONFIG_ORDNER/99-sunshine-sink.conf" <<EOF
-# Virtuelle Tonausgabe fuer Sunshine.
-# Angelegt am $(date '+%d.%m.%Y %H:%M').
+cat > "$PIPEWIRE_CONFIG_DIR/99-sunshine-sink.conf" <<EOF
+# Virtual audio output for Sunshine.
+# Created on $(date '+%Y-%m-%d %H:%M').
 context.objects = [
     {   factory = adapter
         args = {
             factory.name     = support.null-audio-sink
-            node.name        = "$TON_GERAET"
-            node.description = "Sunshine Ton"
+            node.name        = "$AUDIO_SINK"
+            node.description = "Sunshine Audio"
             media.class      = Audio/Sink
             object.linger    = true
             audio.position   = [ FL FR ]
@@ -625,101 +623,101 @@ context.objects = [
 ]
 EOF
 
-chown -R "$BENUTZER:$BENUTZER_GRUPPE" "$BENUTZER_HEIM/.config/pipewire"
+chown -R "$USERNAME:$USER_GROUP" "$USER_HOME/.config/pipewire"
 
-# Die Tondienste des Benutzers einschalten. Der Zusatz add-wants ist
-# noetig, weil sie sonst an graphical-session.target haengen - und das
-# wird nie erreicht, wenn die Arbeitsflaeche als Systemdienst laeuft.
-for TON_DIENST in pipewire.socket pipewire-pulse.socket wireplumber.service; do
-    als_benutzer systemctl --user enable "$TON_DIENST" >/dev/null 2>&1 || true
+# Enable the user's audio services. The add-wants part is required
+# because they otherwise hang off graphical-session.target - and that
+# is never reached when the desktop runs as a system service.
+for AUDIO_SERVICE in pipewire.socket pipewire-pulse.socket wireplumber.service; do
+    as_user systemctl --user enable "$AUDIO_SERVICE" >/dev/null 2>&1 || true
 done
 
-for TON_DIENST in pipewire.service pipewire-pulse.service wireplumber.service; do
-    als_benutzer systemctl --user add-wants default.target "$TON_DIENST" \
+for AUDIO_SERVICE in pipewire.service pipewire-pulse.service wireplumber.service; do
+    as_user systemctl --user add-wants default.target "$AUDIO_SERVICE" \
         >/dev/null 2>&1 || true
 done
 
-als_benutzer systemctl --user daemon-reload >/dev/null 2>&1 || true
+as_user systemctl --user daemon-reload >/dev/null 2>&1 || true
 
-for TON_DIENST in pipewire pipewire-pulse wireplumber; do
-    als_benutzer systemctl --user restart "$TON_DIENST" >/dev/null 2>&1 || true
+for AUDIO_SERVICE in pipewire pipewire-pulse wireplumber; do
+    as_user systemctl --user restart "$AUDIO_SERVICE" >/dev/null 2>&1 || true
 done
 
-# PipeWire braucht einen Moment, bis das Geraet steht.
+# PipeWire needs a moment before the device shows up.
 sleep 4
 
-TON_GERAETE="$(als_benutzer pactl list short sinks 2>/dev/null || true)"
+AUDIO_SINKS="$(as_user pactl list short sinks 2>/dev/null || true)"
 
-if [[ "$TON_GERAETE" == *"$TON_GERAET"* ]]; then
-    hinweis "Tonausgabe '$TON_GERAET' ist da."
+if [[ "$AUDIO_SINKS" == *"$AUDIO_SINK"* ]]; then
+    note "Audio output '$AUDIO_SINK' is present."
 else
-    warnung "Tonausgabe '$TON_GERAET' noch nicht sichtbar."
-    warnung "Nach einem Neustart des Servers sollte sie erscheinen."
+    warn "Audio output '$AUDIO_SINK' not visible yet."
+    warn "It should appear after a reboot of the server."
 fi
 
-# Sunshine sagen, welche Ausgabe es aufnehmen soll.
-SUNSHINE_KONFIG="$BENUTZER_HEIM/.config/sunshine/sunshine.conf"
+# Tell Sunshine which output to capture.
+SUNSHINE_CONFIG="$USER_HOME/.config/sunshine/sunshine.conf"
 
-mkdir -p "$(dirname "$SUNSHINE_KONFIG")"
+mkdir -p "$(dirname "$SUNSHINE_CONFIG")"
 
-if [[ ! -f "$SUNSHINE_KONFIG" ]]; then
-    : > "$SUNSHINE_KONFIG"
+if [[ ! -f "$SUNSHINE_CONFIG" ]]; then
+    : > "$SUNSHINE_CONFIG"
 fi
 
-sichern "$SUNSHINE_KONFIG"
+backup_file "$SUNSHINE_CONFIG"
 
-if grep -q '^audio_sink' "$SUNSHINE_KONFIG"; then
-    sed -i "s/^audio_sink.*/audio_sink = $TON_GERAET/" "$SUNSHINE_KONFIG"
+if grep -q '^audio_sink' "$SUNSHINE_CONFIG"; then
+    sed -i "s/^audio_sink.*/audio_sink = $AUDIO_SINK/" "$SUNSHINE_CONFIG"
 else
-    printf 'audio_sink = %s\n' "$TON_GERAET" >> "$SUNSHINE_KONFIG"
+    printf 'audio_sink = %s\n' "$AUDIO_SINK" >> "$SUNSHINE_CONFIG"
 fi
 
-chown -R "$BENUTZER:$BENUTZER_GRUPPE" "$BENUTZER_HEIM/.config/sunshine"
+chown -R "$USERNAME:$USER_GROUP" "$USER_HOME/.config/sunshine"
 
-hinweis "In sunshine.conf eingetragen: audio_sink = $TON_GERAET"
+note "Written to sunshine.conf: audio_sink = $AUDIO_SINK"
 
 
 # ----------------------------------------------------------
-# 6 - DIENSTE
+# 6 - SERVICES
 # ----------------------------------------------------------
 
-schritt "[6/10] Dienste anlegen"
+step "[6/10] Creating services"
 
-# Ein frueherer Aufbau mit Xvfb wuerde sich um dieselbe Anzeige streiten.
-if [[ -f "$DIENST_ORDNER/sunshine-xvfb.service" ]]; then
+# An earlier setup using Xvfb would fight over the same display.
+if [[ -f "$SERVICE_DIR/sunshine-xvfb.service" ]]; then
 
-    warnung "Alter Xvfb-Dienst gefunden - er wird abgeschaltet."
+    warn "Old Xvfb service found - it is being disabled."
     systemctl disable --now sunshine-xvfb >/dev/null 2>&1 || true
-    mv "$DIENST_ORDNER/sunshine-xvfb.service" \
-       "$SICHERUNG_ORDNER/sunshine-xvfb.service.abgeloest.$ZEITSTEMPEL"
+    mv "$SERVICE_DIR/sunshine-xvfb.service" \
+       "$BACKUP_DIR/sunshine-xvfb.service.replaced.$TIMESTAMP"
 
 fi
 
-# Damit die Dienste des Benutzers auch ohne Anmeldung laufen duerfen.
-# Nebeneffekt: erst dadurch entsteht /run/user/<UID>, das die beiden
-# Dienste unten als XDG_RUNTIME_DIR brauchen.
-loginctl enable-linger "$BENUTZER" >/dev/null 2>&1 || true
+# So the user's services may run without an active login.
+# Side effect: this is what creates /run/user/<UID>, which the two
+# services below need as XDG_RUNTIME_DIR.
+loginctl enable-linger "$USERNAME" >/dev/null 2>&1 || true
 
-for VERSUCH in 1 2 3 4 5; do
-    [[ -d "/run/user/$BENUTZER_UID" ]] && break
+for ATTEMPT in 1 2 3 4 5; do
+    [[ -d "/run/user/$USER_UID" ]] && break
     sleep 1
 done
 
-if [[ ! -d "/run/user/$BENUTZER_UID" ]]; then
-    warnung "/run/user/$BENUTZER_UID fehlt - die Arbeitsflaeche koennte"
-    warnung "beim ersten Start streiken. Notfalls Server neu starten."
+if [[ ! -d "/run/user/$USER_UID" ]]; then
+    warn "/run/user/$USER_UID is missing - the desktop may"
+    warn "fail on its first start. Reboot the server if needed."
 fi
 
-cat > "$DIENST_ORDNER/sunshine-xorg.service" <<EOF
+cat > "$SERVICE_DIR/sunshine-xorg.service" <<EOF
 [Unit]
-Description=Xorg (dummy) als Bildschirm fuer Sunshine
+Description=Xorg (dummy) as the screen for Sunshine
 After=network.target
 
 [Service]
 Type=simple
-User=$BENUTZER
-Group=$BENUTZER_GRUPPE
-ExecStart=/usr/bin/Xorg :$ANZEIGE_NUMMER -config $(basename "$XORG_KONFIG") -nolisten tcp -noreset -ac
+User=$USERNAME
+Group=$USER_GROUP
+ExecStart=/usr/bin/Xorg :$DISPLAY_NUM -config $(basename "$XORG_CONFIG") -nolisten tcp -noreset -ac
 Restart=always
 RestartSec=5
 
@@ -727,18 +725,18 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-cat > "$DIENST_ORDNER/sunshine-desktop.service" <<EOF
+cat > "$SERVICE_DIR/sunshine-desktop.service" <<EOF
 [Unit]
-Description=XFCE-Arbeitsflaeche auf dem Sunshine-Bildschirm
+Description=XFCE desktop on the Sunshine screen
 After=sunshine-xorg.service
 Requires=sunshine-xorg.service
 
 [Service]
 Type=simple
-User=$BENUTZER
-Group=$BENUTZER_GRUPPE
-Environment=DISPLAY=:$ANZEIGE_NUMMER
-Environment=XDG_RUNTIME_DIR=/run/user/$BENUTZER_UID
+User=$USERNAME
+Group=$USER_GROUP
+Environment=DISPLAY=:$DISPLAY_NUM
+Environment=XDG_RUNTIME_DIR=/run/user/$USER_UID
 ExecStartPre=/bin/sleep 3
 ExecStart=/usr/bin/dbus-launch --exit-with-session /usr/bin/xfce4-session
 Restart=always
@@ -748,22 +746,22 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-cat > "$DIENST_ORDNER/sunshine-stream.service" <<EOF
+cat > "$SERVICE_DIR/sunshine-stream.service" <<EOF
 [Unit]
-Description=Sunshine (Bildschirmuebertragung)
+Description=Sunshine (screen streaming)
 After=sunshine-desktop.service
 Requires=sunshine-desktop.service
 
 [Service]
 Type=simple
-User=$BENUTZER
-Group=$BENUTZER_GRUPPE
-Environment=DISPLAY=:$ANZEIGE_NUMMER
-Environment=XDG_RUNTIME_DIR=/run/user/$BENUTZER_UID
+User=$USERNAME
+Group=$USER_GROUP
+Environment=DISPLAY=:$DISPLAY_NUM
+Environment=XDG_RUNTIME_DIR=/run/user/$USER_UID
 
-# Sunshine haette seine Threads gern bevorzugt behandelt. Unter User=
-# gehen die Rechte der Programmdatei verloren, deshalb beides hier:
-# die Berechtigung selbst und die passende Obergrenze.
+# Sunshine would like its threads treated with priority. Under User=
+# the file capabilities of the binary are dropped, so both are set
+# here: the capability itself and the matching limit.
 AmbientCapabilities=CAP_SYS_NICE
 CapabilityBoundingSet=CAP_SYS_NICE
 LimitNICE=-15
@@ -777,78 +775,78 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-chmod 0644 "$DIENST_ORDNER"/sunshine-xorg.service \
-           "$DIENST_ORDNER"/sunshine-desktop.service \
-           "$DIENST_ORDNER"/sunshine-stream.service
+chmod 0644 "$SERVICE_DIR"/sunshine-xorg.service \
+           "$SERVICE_DIR"/sunshine-desktop.service \
+           "$SERVICE_DIR"/sunshine-stream.service
 
 systemctl daemon-reload
 
-hinweis "sunshine-xorg, sunshine-desktop, sunshine-stream angelegt."
+note "sunshine-xorg, sunshine-desktop, sunshine-stream created."
 
 
 # ----------------------------------------------------------
 # 7 - FIREWALL
 #
-# Moonlight braucht:
-#   TCP 47984 (Kopplung), 47989 (Steuerung), 48010 (RTSP)
-#   UDP 47998, 47999, 48000, 48002, 48010 (Bild und Ton)
+# Moonlight needs:
+#   TCP 47984 (pairing), 47989 (control), 48010 (RTSP)
+#   UDP 47998, 47999, 48000, 48002, 48010 (video and audio)
 #
-# Port 47990 ist die Weboberflaeche und wird BEWUSST nicht
-# geoeffnet: darueber laesst sich Sunshine umkonfigurieren.
-# Sie wird vom Server selbst aus bedient.
+# Port 47990 is the web interface and is DELIBERATELY not
+# opened: it is the only way to reconfigure Sunshine. It is
+# operated from the server itself.
 # ----------------------------------------------------------
 
-schritt "[7/10] Firewall einrichten"
+step "[7/10] Configuring the firewall"
 
 if ! command -v ufw >/dev/null 2>&1; then
 
-    warnung "ufw ist nicht installiert - keine Regeln gesetzt."
+    warn "ufw is not installed - no rules were set."
 
 else
 
-    regel_hinzufuegen() {
-        local protokoll="$1"
+    add_rule() {
+        local protocol="$1"
         local port="$2"
 
-        if [[ -n "$ERLAUBTE_IP" ]]; then
-            ufw allow from "$ERLAUBTE_IP" to any port "$port" \
-                proto "$protokoll" comment "Sunshine" >/dev/null
+        if [[ -n "$ALLOWED_IP" ]]; then
+            ufw allow from "$ALLOWED_IP" to any port "$port" \
+                proto "$protocol" comment "Sunshine" >/dev/null
         else
-            ufw allow "${port}/${protokoll}" comment "Sunshine" >/dev/null
+            ufw allow "${port}/${protocol}" comment "Sunshine" >/dev/null
         fi
     }
 
     for PORT in 47984 47989 48010; do
-        regel_hinzufuegen tcp "$PORT"
+        add_rule tcp "$PORT"
     done
 
     for PORT in 47998 47999 48000 48002 48010; do
-        regel_hinzufuegen udp "$PORT"
+        add_rule udp "$PORT"
     done
 
-    if [[ -n "$ERLAUBTE_IP" ]]; then
-        hinweis "Zugriff nur von $ERLAUBTE_IP"
+    if [[ -n "$ALLOWED_IP" ]]; then
+        note "Access restricted to $ALLOWED_IP"
     else
-        hinweis "Zugriff von jeder Adresse."
+        note "Access from any address."
     fi
 
-    hinweis "Port 47990 (Weboberflaeche) bleibt zu - so ist es gewollt."
+    note "Port 47990 (web interface) stays closed - that is intended."
 
 fi
 
 
 # ----------------------------------------------------------
-# 8 - STARTEN
+# 8 - START
 # ----------------------------------------------------------
 
-schritt "[8/10] Dienste starten"
+step "[8/10] Starting the services"
 
 systemctl enable --now sunshine-xorg >/dev/null 2>&1
 
-hinweis "Warte auf den Bildschirm"
+note "Waiting for the screen"
 
-if ! warte_auf_bildschirm; then
-    echo "FEHLER: Anzeige :$ANZEIGE_NUMMER antwortet nicht." >&2
+if ! wait_for_screen; then
+    echo "ERROR: Display :$DISPLAY_NUM does not answer." >&2
     echo "  journalctl -u sunshine-xorg -n 40 --no-pager" >&2
     exit 1
 fi
@@ -860,268 +858,269 @@ sleep 8
 
 
 # ----------------------------------------------------------
-# 9 - ABNAHME
+# 9 - ACCEPTANCE CHECK
 #
-# Der Beweis wird selbst erzeugt: ein eigenes uinput-Geraet.
-# Taucht es in der Geraeteliste auf, nimmt der Bildschirm
-# Eingaben an - ohne dass jemand streamen muss.
+# The proof is produced here: a uinput device of our own. If it
+# shows up in the device list, the screen accepts input - without
+# anyone having to start a stream.
 # ----------------------------------------------------------
 
-schritt "[9/10] Abnahme"
+step "[9/10] Acceptance check"
 
-ALLES_GUT=true
+ALL_GOOD=true
 
-for DIENST in sunshine-xorg sunshine-desktop sunshine-stream; do
+for SERVICE in sunshine-xorg sunshine-desktop sunshine-stream; do
 
-    if systemctl is-active --quiet "$DIENST"; then
-        printf '    %-20s laeuft\n' "$DIENST:"
+    if systemctl is-active --quiet "$SERVICE"; then
+        printf '    %-20s running\n' "$SERVICE:"
     else
-        printf '    %-20s LAEUFT NICHT\n' "$DIENST:"
-        ALLES_GUT=false
+        printf '    %-20s NOT RUNNING\n' "$SERVICE:"
+        ALL_GOOD=false
     fi
 
 done
 
-# Kein "exit" im awk und kein "head": ein Leser, der die Pipe frueh
-# schliesst, laesst den Schreiber an SIGPIPE sterben (Code 141), was
-# zusammen mit "set -o pipefail" faelschlich als Fehler gilt.
-BILDGROESSE="$(DISPLAY=":$ANZEIGE_NUMMER" xdpyinfo \
+# No "exit" in the awk and no "head": a reader that closes the pipe
+# early kills the writer with SIGPIPE (code 141), which together with
+# "set -o pipefail" would wrongly count as a failure.
+SCREEN_SIZE="$(DISPLAY=":$DISPLAY_NUM" xdpyinfo \
     | awk '/dimensions:/ { print $2 }')"
 
-hinweis "Bildgroesse: ${BILDGROESSE:-unbekannt}"
+note "Screen size: ${SCREEN_SIZE:-unknown}"
 
 python3 - <<'PYTHON' &
 import time
 from evdev import UInput, ecodes as e
 
 with UInput({e.EV_KEY: [e.BTN_LEFT], e.EV_REL: [e.REL_X, e.REL_Y]},
-            name="Testmaus-Beweis"):
+            name="Sunshine-Input-Test"):
     time.sleep(15)
 PYTHON
 
-TEST_PROZESS=$!
+TEST_PROCESS=$!
 sleep 4
 
-# Bewusst ohne Pipe geprueft: "grep -q" steigt beim ersten Treffer aus
-# und wuerde das Ergebnis unter "set -o pipefail" falsch negativ machen.
-GERAETE_LISTE="$(DISPLAY=":$ANZEIGE_NUMMER" xinput list)"
+# Deliberately checked without a pipe: "grep -q" exits at the first
+# match, which under "set -o pipefail" would make the result falsely
+# negative.
+DEVICE_LIST="$(DISPLAY=":$DISPLAY_NUM" xinput list)"
 
-if [[ "$GERAETE_LISTE" == *"Testmaus-Beweis"* ]]; then
-    hinweis "Eingabe-Test: BESTANDEN"
+if [[ "$DEVICE_LIST" == *"Sunshine-Input-Test"* ]]; then
+    note "Input test: PASSED"
 else
-    hinweis "Eingabe-Test: FEHLGESCHLAGEN"
-    ALLES_GUT=false
+    note "Input test: FAILED"
+    ALL_GOOD=false
 fi
 
-kill "$TEST_PROZESS" 2>/dev/null || true
-wait "$TEST_PROZESS" 2>/dev/null || true
+kill "$TEST_PROCESS" 2>/dev/null || true
+wait "$TEST_PROCESS" 2>/dev/null || true
 
-# Ton gegenpruefen. Ohne Ausgabegeraet bleibt der Stream stumm.
-TON_GERAETE_JETZT="$(als_benutzer pactl list short sinks 2>/dev/null || true)"
+# Verify audio. Without an output device the stream stays silent.
+AUDIO_SINKS_NOW="$(as_user pactl list short sinks 2>/dev/null || true)"
 
-if [[ "$TON_GERAETE_JETZT" == *"$TON_GERAET"* ]]; then
-    hinweis "Ton-Test:    BESTANDEN ($TON_GERAET vorhanden)"
+if [[ "$AUDIO_SINKS_NOW" == *"$AUDIO_SINK"* ]]; then
+    note "Audio test: PASSED ($AUDIO_SINK present)"
 else
-    hinweis "Ton-Test:    Ausgabe '$TON_GERAET' fehlt noch"
-    warnung "Kein Abbruch - das gibt sich oft nach einem Neustart."
+    note "Audio test: output '$AUDIO_SINK' still missing"
+    warn "Not fatal - this usually sorts itself out after a reboot."
 fi
 
 
 # ----------------------------------------------------------
-# 10 - ZWEITSTARTER
+# 10 - SECOND-SESSION LAUNCHERS
 #
-# Programme wie Browser lassen je Benutzer nur eine Instanz
-# zu. Laeuft schon eine auf der RDP-Flaeche, reicht ein zweiter
-# Aufruf seinen Wunsch einfach dorthin weiter - auf dieser
-# Flaeche passiert dann scheinbar gar nichts.
+# Applications such as browsers allow only one instance per
+# user. If one is already running on the RDP desktop, a second
+# call simply hands its request over there - and on this desktop
+# nothing appears to happen.
 #
-# Abhilfe ist ein eigenes Profilverzeichnis je Programm.
+# The remedy is a separate profile directory per application.
 # ----------------------------------------------------------
 
-schritt "[10/10] Starter fuer zweite Sitzungen"
+step "[10/10] Launchers for second sessions"
 
-if [[ "$STARTER_ANLEGEN" != true ]]; then
+if [[ "$CREATE_LAUNCHERS" != true ]]; then
 
-    hinweis "Uebersprungen (so gewuenscht)."
+    note "Skipped, as requested."
 
 else
 
-    STARTER_ORDNER="$BENUTZER_HEIM/.local/share/applications"
-    PROFIL_BASIS="$BENUTZER_HEIM/$ZWEITPROFIL_ORDNER_NAME"
+    LAUNCHER_DIR="$USER_HOME/.local/share/applications"
+    PROFILE_BASE="$USER_HOME/$PROFILE_DIR_NAME"
 
-    mkdir -p "$STARTER_ORDNER" "$PROFIL_BASIS"
+    mkdir -p "$LAUNCHER_DIR" "$PROFILE_BASE"
 
-    ANGELEGTE_STARTER=0
+    CREATED_LAUNCHERS=0
 
-    # Legt einen Starter an, wenn das Programm vorhanden ist.
-    #   $1 Programmbefehl, $2 Anzeigename, $3 Zusatzargumente, $4 Symbol
-    starter_anlegen() {
-        local befehl="$1"
-        local anzeigename="$2"
-        local argumente="$3"
-        local symbol="$4"
+    # Creates a launcher if the application is present.
+    #   $1 command, $2 display name, $3 extra arguments, $4 icon
+    create_launcher() {
+        local program="$1"
+        local display_name="$2"
+        local arguments="$3"
+        local icon="$4"
 
-        if ! command -v "$befehl" >/dev/null 2>&1; then
+        if ! command -v "$program" >/dev/null 2>&1; then
             return 0
         fi
 
-        local datei="$STARTER_ORDNER/${befehl}-zweite-sitzung.desktop"
+        local path="$LAUNCHER_DIR/${program}-second-session.desktop"
 
-        cat > "$datei" <<EOF
+        cat > "$path" <<EOF
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=$anzeigename (zweite Sitzung)
-Comment=Eigenes Profil, laeuft neben einer bereits geoeffneten Sitzung
-Exec=$befehl $argumente
-Icon=$symbol
+Name=$display_name (second session)
+Comment=Separate profile, runs next to an already open session
+Exec=$program $arguments
+Icon=$icon
 Terminal=false
 Categories=Network;
 EOF
 
-        chmod 0644 "$datei"
-        hinweis "Starter angelegt: $anzeigename"
-        ANGELEGTE_STARTER=$(( ANGELEGTE_STARTER + 1 ))
+        chmod 0644 "$path"
+        note "Launcher created: $display_name"
+        CREATED_LAUNCHERS=$(( CREATED_LAUNCHERS + 1 ))
     }
 
-    # Chrome und Verwandte: eigenes Datenverzeichnis genuegt.
-    starter_anlegen google-chrome "Google Chrome" \
-        "--user-data-dir=$PROFIL_BASIS/google-chrome" "google-chrome"
+    # Chrome and relatives: a separate data directory is enough.
+    create_launcher google-chrome "Google Chrome" \
+        "--user-data-dir=$PROFILE_BASE/google-chrome" "google-chrome"
 
-    starter_anlegen google-chrome-stable "Google Chrome" \
-        "--user-data-dir=$PROFIL_BASIS/google-chrome" "google-chrome"
+    create_launcher google-chrome-stable "Google Chrome" \
+        "--user-data-dir=$PROFILE_BASE/google-chrome" "google-chrome"
 
-    starter_anlegen chromium "Chromium" \
-        "--user-data-dir=$PROFIL_BASIS/chromium" "chromium"
+    create_launcher chromium "Chromium" \
+        "--user-data-dir=$PROFILE_BASE/chromium" "chromium"
 
-    starter_anlegen chromium-browser "Chromium" \
-        "--user-data-dir=$PROFIL_BASIS/chromium" "chromium-browser"
+    create_launcher chromium-browser "Chromium" \
+        "--user-data-dir=$PROFILE_BASE/chromium" "chromium-browser"
 
-    starter_anlegen microsoft-edge "Microsoft Edge" \
-        "--user-data-dir=$PROFIL_BASIS/edge" "microsoft-edge"
+    create_launcher microsoft-edge "Microsoft Edge" \
+        "--user-data-dir=$PROFILE_BASE/edge" "microsoft-edge"
 
-    starter_anlegen brave-browser "Brave" \
-        "--user-data-dir=$PROFIL_BASIS/brave" "brave-browser"
+    create_launcher brave-browser "Brave" \
+        "--user-data-dir=$PROFILE_BASE/brave" "brave-browser"
 
-    starter_anlegen vivaldi-stable "Vivaldi" \
-        "--user-data-dir=$PROFIL_BASIS/vivaldi" "vivaldi"
+    create_launcher vivaldi-stable "Vivaldi" \
+        "--user-data-dir=$PROFILE_BASE/vivaldi" "vivaldi"
 
-    starter_anlegen code "Visual Studio Code" \
-        "--user-data-dir=$PROFIL_BASIS/vscode" "code"
+    create_launcher code "Visual Studio Code" \
+        "--user-data-dir=$PROFILE_BASE/vscode" "code"
 
-    # Firefox und Thunderbird brauchen zusaetzlich --no-remote, sonst
-    # reichen sie den Aufruf trotz eigenem Profil weiter.
-    starter_anlegen firefox "Firefox" \
-        "--no-remote --profile $PROFIL_BASIS/firefox" "firefox"
+    # Firefox and Thunderbird additionally need --no-remote, otherwise
+    # they hand the call over despite the separate profile.
+    create_launcher firefox "Firefox" \
+        "--no-remote --profile $PROFILE_BASE/firefox" "firefox"
 
-    starter_anlegen thunderbird "Thunderbird" \
-        "--no-remote --profile $PROFIL_BASIS/thunderbird" "thunderbird"
+    create_launcher thunderbird "Thunderbird" \
+        "--no-remote --profile $PROFILE_BASE/thunderbird" "thunderbird"
 
-    chown -R "$BENUTZER:$BENUTZER_GRUPPE" "$STARTER_ORDNER" "$PROFIL_BASIS"
+    chown -R "$USERNAME:$USER_GROUP" "$LAUNCHER_DIR" "$PROFILE_BASE"
 
-    # Damit die neuen Eintraege sofort im Menue auftauchen.
+    # So the new entries show up in the menu right away.
     if command -v update-desktop-database >/dev/null 2>&1; then
-        update-desktop-database "$STARTER_ORDNER" >/dev/null 2>&1 || true
+        update-desktop-database "$LAUNCHER_DIR" >/dev/null 2>&1 || true
     fi
 
-    if (( ANGELEGTE_STARTER == 0 )); then
-        hinweis "Keines der bekannten Programme gefunden - nichts angelegt."
+    if (( CREATED_LAUNCHERS == 0 )); then
+        note "None of the known applications found - nothing created."
     else
-        hinweis "$ANGELEGTE_STARTER Starter liegen im Menue unter 'Internet'."
+        note "$CREATED_LAUNCHERS launchers are in the menu under 'Internet'."
     fi
 
     echo
-    hinweis "Grenzen dieser Loesung, damit es spaeter nicht ueberrascht:"
-    hinweis "- Die Starter erscheinen in BEIDEN Menues (gleiches Heimatverz.)."
-    hinweis "- Das zweite Profil ist leer: eigene Lesezeichen, eigene Anmeldung."
-    hinweis "- Nicht jedes Programm laesst sich so trennen. JDownloader,"
-    hinweis "  pCloud und aehnliche sperren sich mit eigenen Dateien und"
-    hinweis "  lassen sich nur auf EINER Flaeche betreiben."
-    hinweis "- Einfachste Alternative bleibt: das Programm auf der anderen"
-    hinweis "  Flaeche schliessen."
+    note "Limits of this approach, so it does not surprise you later:"
+    note "- The launchers appear in BOTH menus (same home directory)."
+    note "- The second profile is empty: own bookmarks, own logins."
+    note "- Not every application can be separated this way. JDownloader,"
+    note "  pCloud and similar lock themselves with their own files and"
+    note "  can only be run on ONE desktop."
+    note "- The simplest alternative remains: close the application on"
+    note "  the other desktop."
 
 fi
 
 
 # ----------------------------------------------------------
-# ERGEBNIS
+# RESULT
 # ----------------------------------------------------------
 
 echo
 echo "=================================================="
 
-if [[ "$ALLES_GUT" == true ]]; then
-    echo " FERTIG"
+if [[ "$ALL_GOOD" == true ]]; then
+    echo " DONE"
 else
-    echo " FERTIG, ABER MIT PROBLEMEN (siehe oben)"
+    echo " DONE, BUT WITH PROBLEMS (see above)"
 fi
 
 echo "=================================================="
 echo
-echo " Benutzer:    $BENUTZER"
-echo " Anzeige:     :$ANZEIGE_NUMMER"
-echo " Aufloesung:  $AUFLOESUNG"
+echo " User:        $USERNAME"
+echo " Display:     :$DISPLAY_NUM"
+echo " Resolution:  $RESOLUTION"
 
-if [[ -n "$ERLAUBTE_IP" ]]; then
-    echo " Erlaubte IP: $ERLAUBTE_IP"
+if [[ -n "$ALLOWED_IP" ]]; then
+    echo " Allowed IP:  $ALLOWED_IP"
 else
-    echo " Erlaubte IP: alle"
+    echo " Allowed IP:  any"
 fi
 
 echo
 echo " +----------------------------------------------+"
-echo " |  WICHTIG FUER MOONLIGHT                      |"
+echo " |  IMPORTANT FOR MOONLIGHT                     |"
 echo " |                                              |"
-echo " |  In den Einstellungen des Clients            |"
+echo " |  In the client settings,                     |"
 echo " |                                              |"
-echo " |    'Maus fuer Remotedesktop optimieren'      |"
+echo " |    'optimize mouse for remote desktop'       |"
 echo " |                                              |"
-echo " |  AUSSCHALTEN. Sonst sendet Moonlight         |"
-echo " |  absolute Positionen, die hier nicht         |"
-echo " |  ankommen - das Bild laeuft dann, aber der   |"
-echo " |  Mauszeiger bewegt sich nicht.               |"
+echo " |  has to be switched OFF. Otherwise Moonlight |"
+echo " |  sends absolute positions that never arrive  |"
+echo " |  here - the picture runs, but the pointer    |"
+echo " |  does not move.                              |"
 echo " +----------------------------------------------+"
 echo
-echo " NAECHSTE SCHRITTE"
+echo " NEXT STEPS"
 echo
-echo " 1. Weboberflaeche auf dem Server oeffnen:"
+echo " 1. Open the web interface on the server:"
 echo "      https://localhost:47990"
-echo "    Entweder im Browser der RDP-Flaeche, oder von"
-echo "    aussen durch einen Tunnel:"
+echo "    Either from a browser on the RDP desktop, or"
+echo "    from outside through a tunnel:"
 echo "      ssh -L 47990:localhost:47990 root@<server>"
 echo
-echo "    Die Zertifikatswarnung ist normal (selbst ausgestellt)."
+echo "    The certificate warning is expected (self-signed)."
 echo
-echo " 2. Beim ersten Besuch Benutzername und Passwort fuer"
-echo "    Sunshine festlegen und notieren."
+echo " 2. On the first visit, set a user name and password"
+echo "    for Sunshine and write them down."
 echo
-echo " 3. In Moonlight den Rechner ueber seine oeffentliche"
-echo "    Adresse von Hand hinzufuegen."
+echo " 3. In Moonlight, add the machine manually using its"
+echo "    public address."
 echo
-echo " 4. Die PIN-Seite der Weboberflaeche VOR dem Klick in"
-echo "    Moonlight oeffnen. Sonst laufen die Versuche ab und"
-echo "    blockieren sich gegenseitig (Fehler 409)."
+echo " 4. Open the PIN page of the web interface BEFORE"
+echo "    clicking connect in Moonlight. Otherwise the"
+echo "    attempts expire and block each other (error 409)."
 echo
-echo " NUETZLICHE BEFEHLE"
+echo " USEFUL COMMANDS"
 echo "   systemctl status sunshine-stream"
 echo "   systemctl restart sunshine-stream"
 echo "   journalctl -u sunshine-stream -n 50 --no-pager"
 echo
-echo "   Geraete waehrend einer Verbindung ansehen:"
-echo "     DISPLAY=:$ANZEIGE_NUMMER xinput list"
+echo "   Show the devices while a client is connected:"
+echo "     DISPLAY=:$DISPLAY_NUM xinput list"
 echo
-echo "   Tonausgabe pruefen (als $BENUTZER):"
-echo "     XDG_RUNTIME_DIR=/run/user/$BENUTZER_UID pactl list short sinks"
+echo "   Check the audio output (as $USERNAME):"
+echo "     XDG_RUNTIME_DIR=/run/user/$USER_UID pactl list short sinks"
 echo
-echo " ALLES WIEDER ENTFERNEN"
+echo " REMOVING EVERYTHING AGAIN"
 echo "   systemctl disable --now sunshine-stream sunshine-desktop sunshine-xorg"
-echo "   rm -f $DIENST_ORDNER/sunshine-{xorg,desktop,stream}.service"
+echo "   rm -f $SERVICE_DIR/sunshine-{xorg,desktop,stream}.service"
 echo "   systemctl daemon-reload"
 echo "   apt-get remove -y sunshine"
 echo
-echo " Der RDP-Zugang ist davon in keinem Fall betroffen."
+echo " RDP access is not affected in any case."
 echo
-echo " Sicherungen dieses Laufs: $SICHERUNG_ORDNER/*.$ZEITSTEMPEL"
+echo " Backups from this run: $BACKUP_DIR/*.$TIMESTAMP"
 echo "=================================================="
 
-[[ "$ALLES_GUT" == true ]]
+[[ "$ALL_GOOD" == true ]]
