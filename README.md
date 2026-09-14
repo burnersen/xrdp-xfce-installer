@@ -47,8 +47,8 @@ Other distributions are not supported.
 Run as root, from an SSH session:
 
 ```bash
-sudo -i
-bash <(curl -fsSL https://raw.githubusercontent.com/burnersen/xrdp-xfce-installer/refs/heads/main/install.sh)
+curl -fsSLo install.sh https://raw.githubusercontent.com/burnersen/xrdp-xfce-installer/refs/heads/main/install.sh
+bash install.sh
 ```
 
 On an unstable connection, start `tmux` first. If the connection drops, reconnect and run `tmux attach` to pick the installation up where it left off.
