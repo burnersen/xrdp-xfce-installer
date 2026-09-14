@@ -13,6 +13,7 @@ set -Eeuo pipefail
 #   - time zone Europe/Berlin
 #   - German keyboard layout (console and X11)
 #   - German XFCE session for one user
+#   - German language pack for Firefox (if available)
 #
 # Safe to run more than once.
 # ==========================================================
@@ -167,12 +168,42 @@ apt-get install -y \
 # Make sure the locale is generated even if the language
 # pack did not do it.
 
-if ! locale -a 2>/dev/null | grep -qi "^de_DE.utf8$"; then
+# "> /dev/null" instead of "grep -q": with -q, grep exits at the
+# first match and kills the writer with SIGPIPE, which
+# "set -o pipefail" would report as a failure. Without -q grep
+# reads to the end, so the pipe closes normally.
+
+if ! locale -a 2>/dev/null | grep -i "^de_DE.utf8$" > /dev/null; then
 
     sed -i 's/^# *de_DE.UTF-8 UTF-8/de_DE.UTF-8 UTF-8/' /etc/locale.gen
     locale-gen de_DE.UTF-8
 
 fi
+
+# Firefox from Mozilla's APT repository ships in English only.
+# The language pack comes from that same repository, which
+# install.sh sets up - so a missing package is not an error
+# here, it just means Firefox was installed differently.
+
+if ! command -v firefox >/dev/null 2>&1; then
+
+    echo "Firefox is not installed - skipping its language pack."
+
+elif apt-cache show firefox-l10n-de >/dev/null 2>&1; then
+
+    echo "Installing German language pack for Firefox..."
+
+    if ! apt-get install -y firefox-l10n-de; then
+        echo "WARNING: German Firefox language pack could not be installed."
+    fi
+
+else
+
+    echo "Package 'firefox-l10n-de' is not available - skipping."
+    echo "It comes from Mozilla's APT repository (see install.sh)."
+
+fi
+
 
 
 echo

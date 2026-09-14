@@ -4,6 +4,8 @@ Interactive installer for a XFCE remote desktop on Ubuntu, with persistent sessi
 
 The script installs a lightweight XFCE desktop, makes it reachable over RDP, creates a non-root sudo user, installs browsers and secures the server. It is written for clean Ubuntu installations, for example on a fresh VPS.
 
+Two optional companion scripts complete the setup: `german.sh` for a German system, and `sunshine.sh` for a second desktop that can be streamed with Moonlight.
+
 ---
 
 ## Features
@@ -26,10 +28,12 @@ The script installs a lightweight XFCE desktop, makes it reachable over RDP, cre
 
 **Extras**
 
+- Fast DNS resolvers, replacing name servers that make every page load slowly
+- Google Chrome on amd64, Chromium elsewhere
+- Firefox from Mozilla's APT repository instead of the Snap build
 - FUSE 2, so AppImage applications start without further setup
 - Optional JDownloader 2, either as a desktop application or as a systemd service
 - `xrdp-session-reset` helper command for the rare case of a stuck session
-- Google Chrome on amd64, Chromium elsewhere, Firefox where available
 
 ---
 
@@ -72,6 +76,46 @@ Afterwards, reboot and connect with an RDP client:
 
 ```text
 SERVER_IP:PORT
+```
+
+---
+
+## DNS resolvers
+
+Several hosting providers ship name servers that throttle bursts of queries. The effect is easy to misread: a single lookup on the command line answers in milliseconds, downloads run at full speed, and yet almost every web page loads slowly or fails with a timeout.
+
+The reason is the number of names involved. A browser resolves 20 to 50 different hosts while building one page - images, fonts, statistics, advertising. Once a share of those queries is dropped, the resolver waits 5, 10 or 20 seconds for each of them, and the page stalls long before the data transfer would even start.
+
+The installer therefore replaces the name servers with:
+
+```text
+1.1.1.1     Cloudflare
+8.8.8.8     Google
+```
+
+The addresses are written into the existing netplan file, not into an additional one. Name servers configured on the link take precedence over anything in `resolved.conf`, and netplan **merges** lists from several files instead of replacing them - an extra file would leave the old servers in first place and change nothing.
+
+Before the change the file is backed up next to the original, and `netplan generate` validates the result before it is applied, so a broken file cannot cut the network connection.
+
+`cloud-init` is told to leave the network configuration alone afterwards, because it would otherwise write the provider's name servers back on the next boot:
+
+```text
+/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+```
+
+To go back to the provider's name servers, restore the backup and remove that file:
+
+```bash
+ls /etc/netplan/                       # find the backup
+cp /etc/netplan/50-cloud-init.yaml.backup_* /etc/netplan/50-cloud-init.yaml
+rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+netplan apply
+```
+
+Whether the change took effect is visible per network device, not only globally:
+
+```bash
+resolvectl status
 ```
 
 ---
@@ -139,6 +183,24 @@ If RDP is publicly accessible, use a long randomly generated password. fail2ban 
 
 ---
 
+## Browsers
+
+Google Chrome is installed from Google's own `.deb` package on amd64. On other architectures the installer falls back to Chromium.
+
+Firefox comes from **Mozilla's APT repository**, not from Ubuntu's package. Ubuntu's `firefox` package is only a wrapper that installs the Snap build, and that build misbehaves in a remote session.
+
+The APT pin that comes with it is not optional:
+
+```text
+Package: *
+Pin: origin packages.mozilla.org
+Pin-Priority: 1000
+```
+
+Without the pin, Ubuntu's wrapper wins the next upgrade and pulls the Snap back in.
+
+---
+
 ## JDownloader
 
 Optional, and the installer asks which mode to use.
@@ -150,6 +212,65 @@ Optional, and the installer asks which mode to use.
 One detail worth knowing: the desktop mode needs the full JRE. The headless JRE package has no windowing support, so JDownloader falls back to headless mode even with a valid `DISPLAY` and no window ever appears. The installer picks the right package for the selected mode.
 
 The first start is interactive and asks for My JDownloader credentials, so it cannot be automated. The installer prints the exact command at the end.
+
+---
+
+## Companion script: German localisation
+
+`german.sh` turns the server into a German system. Run it after `install.sh`.
+
+```bash
+curl -fsSLo german.sh https://raw.githubusercontent.com/burnersen/xrdp-xfce-installer/refs/heads/main/german.sh
+bash german.sh
+```
+
+It sets the system locale to `de_DE.UTF-8`, the time zone to Europe/Berlin, the keyboard layout for console and X11, the session language for one user, and installs the German language pack for Firefox if Mozilla's repository is present.
+
+The language applies when a session **starts**. A session that is already running keeps the old language, so reboot or log out inside XFCE and reconnect.
+
+---
+
+## Companion script: Sunshine and Moonlight
+
+`sunshine.sh` adds a **second** desktop that is streamed with [Sunshine](https://github.com/LizardByte/Sunshine) and watched with a Moonlight client. Video playback is noticeably smoother than over RDP, because the picture is encoded as a video stream instead of being sent as changed screen regions.
+
+```bash
+curl -fsSLo sunshine.sh https://raw.githubusercontent.com/burnersen/xrdp-xfce-installer/refs/heads/main/sunshine.sh
+bash sunshine.sh
+```
+
+The RDP setup is not modified. Three services are created:
+
+```text
+sunshine-xorg      Xorg with the dummy driver on display :20
+sunshine-desktop   XFCE running on that display
+sunshine-stream    Sunshine capturing and streaming it
+```
+
+**Xorg with the dummy driver, not Xvfb.** This is the single most important detail. Xvfb accepts no input devices at all: Sunshine creates its mouse and keyboard as virtual `uinput` devices the moment a client connects, and under Xvfb those are silently discarded. The picture arrives, nothing can be operated. A real X server picks them up through udev. For the same reason `AutoAddDevices` must stay at `true`, although many headless guides recommend turning it off.
+
+**In the Moonlight client, "optimize mouse for remote desktop" has to be switched off.** With that setting the client sends absolute positions, which do not arrive at the server - the picture runs, but the pointer never moves. This is a client setting; the server cannot correct it.
+
+The script also sets up a virtual audio output over PipeWire, because a server has no sound card and the stream would otherwise be silent.
+
+The web interface on port 47990 is deliberately **not** opened in the firewall. It is the only way to reconfigure Sunshine, so it is reached from the server itself:
+
+```text
+https://localhost:47990
+```
+
+either from a browser on the RDP desktop, or through an SSH tunnel:
+
+```bash
+ssh -L 47990:localhost:47990 root@SERVER_IP
+```
+
+Open the PIN page **before** clicking connect in Moonlight. Otherwise the attempts expire and block each other with error 409.
+
+Two limitations worth knowing:
+
+- RDP and Moonlight show **different** desktops. The files are the same, the running applications are not. Programs that allow only one instance per user, such as browsers, therefore do nothing when started on the second desktop while they are already open on the first. The script can create launchers with separate profiles for the common ones.
+- Gamepads need the `uhid` kernel module, which many VPS kernels do not provide. Mouse and keyboard use `uinput` and are not affected.
 
 ---
 
@@ -172,7 +293,8 @@ If SSH is unreachable as well, use the provider's web console. Most VPS provider
 - A reboot is recommended before the first RDP login.
 - The firewall rules cover IPv4 only.
 - If the allowed IP address changes, update the UFW rule before reconnecting.
-- pCloud, Sunshine and similar applications are not installed by the script. FUSE 2 is present, so AppImages run out of the box.
+- pCloud and similar applications are not installed by the scripts. FUSE 2 is present, so AppImages run out of the box.
+- Moonlight has no clipboard sharing between client and server. RDP has.
 - On macOS RDP clients, keyboard layout and modifier keys may need additional client-side configuration.
 
 ---

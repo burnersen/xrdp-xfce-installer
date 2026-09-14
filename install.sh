@@ -12,6 +12,8 @@ set -Eeuo pipefail
 #   - Custom RDP port
 #   - UFW firewall (SSH access is preserved)
 #   - fail2ban for SSH and XRDP
+#   - Fast DNS resolvers (the provider name servers are replaced)
+#   - Google Chrome and Firefox (Firefox from Mozilla APT, not Snap)
 #   - Optional: JDownloader 2 (desktop app or headless service)
 # ==========================================================
 
@@ -407,11 +409,112 @@ fi
 
 
 # ----------------------------------------------------------
+# DNS RESOLVERS
+#
+# Some hosting providers ship name servers that throttle
+# bursts of queries. A browser resolves 20-50 names while
+# building a single page, so the throttling shows up as pages
+# that load slowly or time out - while a single lookup on the
+# command line still looks perfectly healthy.
+#
+# The addresses are replaced where netplan configures the
+# link. Name servers defined there take precedence over
+# anything in resolved.conf, and netplan MERGES lists from
+# additional files instead of replacing them - so editing the
+# existing file is the only reliable way.
+# ----------------------------------------------------------
+
+echo
+echo "[1/13] Configuring DNS resolvers"
+
+readonly DNS_PRIMARY="1.1.1.1"
+readonly DNS_SECONDARY="8.8.8.8"
+
+export DEBIAN_FRONTEND=noninteractive
+
+# "sed -n 1p" instead of "head -n1": a reader that closes the
+# pipe early kills grep with SIGPIPE, which "set -o pipefail"
+# would report as a failure.
+NETPLAN_FILE="$(grep -l 'nameservers' /etc/netplan/*.yaml 2>/dev/null | sed -n '1p' || true)"
+
+if [[ -z "$NETPLAN_FILE" ]]; then
+
+    echo "No netplan file with name servers found - keeping current setup."
+
+else
+
+    echo "Setting $DNS_PRIMARY and $DNS_SECONDARY in $NETPLAN_FILE"
+
+    NETPLAN_BACKUP="${NETPLAN_FILE}.backup_$(date +%Y%m%d_%H%M%S)"
+    cp -a "$NETPLAN_FILE" "$NETPLAN_BACKUP"
+
+    if ! python3 -c 'import yaml' 2>/dev/null; then
+        apt-get update
+        apt-get install -y python3-yaml
+    fi
+
+    # Rewriting the YAML is safer than a text substitution:
+    # the provider addresses differ between machines.
+    python3 - "$NETPLAN_FILE" "$DNS_PRIMARY" "$DNS_SECONDARY" <<'PYTHON'
+import sys
+import yaml
+
+path, primary, secondary = sys.argv[1], sys.argv[2], sys.argv[3]
+
+with open(path) as handle:
+    config = yaml.safe_load(handle) or {}
+
+devices = config.get("network", {}).get("ethernets", {})
+
+if not devices:
+    sys.exit("no ethernet device found in netplan configuration")
+
+for device in devices.values():
+    device.setdefault("nameservers", {})["addresses"] = [primary, secondary]
+
+with open(path, "w") as handle:
+    yaml.safe_dump(config, handle, default_flow_style=False, sort_keys=False)
+PYTHON
+
+    chmod 600 "$NETPLAN_FILE"
+
+    # "netplan generate" only validates the files and writes the
+    # backend configuration. It does not touch the running network,
+    # so a broken file is caught before it can cut the connection.
+    if netplan generate; then
+
+        netplan apply
+        sleep 2
+
+        echo "Name servers now in use:"
+        resolvectl status 2>/dev/null \
+            | grep -i 'DNS Server' \
+            | sed 's/^/  /' || true
+
+    else
+
+        echo "WARNING: netplan rejected the change - restoring the backup."
+        cp -a "$NETPLAN_BACKUP" "$NETPLAN_FILE"
+        netplan generate || true
+
+    fi
+
+    # Without this, cloud-init writes the provider's name servers
+    # back into the file on the next boot.
+    if [[ -d /etc/cloud/cloud.cfg.d ]]; then
+        echo 'network: {config: disabled}' \
+            > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+    fi
+
+fi
+
+
+# ----------------------------------------------------------
 # SYSTEM UPDATE
 # ----------------------------------------------------------
 
 echo
-echo "[1/12] Updating system"
+echo "[2/13] Updating system"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -424,7 +527,7 @@ apt-get upgrade -y
 # ----------------------------------------------------------
 
 echo
-echo "[2/12] Installing XFCE, XRDP and dependencies"
+echo "[3/13] Installing XFCE, XRDP and dependencies"
 
 apt-get install -y \
     sudo \
@@ -518,7 +621,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[3/12] Configuring XRDP"
+echo "[4/13] Configuring XRDP"
 
 if getent group ssl-cert >/dev/null 2>&1; then
     usermod -aG ssl-cert xrdp
@@ -566,7 +669,7 @@ set_ini_key "$XRDP_INI" "max_bpp" "24"
 # ----------------------------------------------------------
 
 echo
-echo "[4/12] Configuring persistent sessions"
+echo "[5/13] Configuring persistent sessions"
 
 set_ini_key "$SESMAN_INI" "Policy" "Default"
 set_ini_key "$SESMAN_INI" "KillDisconnected" "false"
@@ -589,7 +692,7 @@ systemctl restart xrdp
 # ----------------------------------------------------------
 
 echo
-echo "[5/12] Configuring user '$USERNAME'"
+echo "[6/13] Configuring user '$USERNAME'"
 
 if [[ "$USER_EXISTS" == false ]]; then
 
@@ -640,7 +743,7 @@ USER_GROUP="$(id -gn "$USERNAME")"
 # ----------------------------------------------------------
 
 echo
-echo "[6/12] Configuring XFCE session"
+echo "[7/13] Configuring XFCE session"
 
 cat > "$HOME_DIR/.xsession" <<'EOF'
 exec startxfce4
@@ -660,7 +763,7 @@ chmod 0644 "$HOME_DIR/.xsession"
 # ----------------------------------------------------------
 
 echo
-echo "[7/12] Configuring polkit for XRDP"
+echo "[8/13] Configuring polkit for XRDP"
 
 if command -v pkaction >/dev/null 2>&1; then
 
@@ -753,7 +856,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[8/12] Configuring UFW"
+echo "[9/13] Configuring UFW"
 
 declare -a SSH_PORTS=()
 
@@ -949,7 +1052,7 @@ ufw --force enable
 # ----------------------------------------------------------
 
 echo
-echo "[9/12] Configuring fail2ban"
+echo "[10/13] Configuring fail2ban"
 
 SESMAN_LOG="/var/log/xrdp-sesman.log"
 
@@ -1007,7 +1110,7 @@ systemctl restart fail2ban
 # ----------------------------------------------------------
 
 echo
-echo "[10/12] Installing browsers"
+echo "[11/13] Installing browsers"
 
 
 # ----------------------------------------------------------
@@ -1076,16 +1179,50 @@ fi
 # ----------------------------------------------------------
 # FIREFOX
 #
-# On modern Ubuntu versions the package may install Firefox
-# through Snap.
+# Ubuntu's "firefox" package is only a wrapper that installs
+# the Snap build. That build misbehaves inside an XRDP or
+# Sunshine session, so the official Mozilla APT repository is
+# used instead.
+#
+# The APT pin is not optional: without it Ubuntu's wrapper
+# wins the next upgrade and drags the Snap back in.
 #
 # Browser installation failure is non-fatal.
 # ----------------------------------------------------------
 
-echo "Installing Firefox..."
+echo "Installing Firefox from Mozilla's APT repository..."
 
-if ! apt-get install -y firefox; then
-    echo "WARNING: Firefox installation failed."
+# Remove the Snap build and the wrapper package first.
+if command -v snap >/dev/null 2>&1; then
+    snap remove --purge firefox >/dev/null 2>&1 || true
+fi
+
+apt-get purge -y firefox >/dev/null 2>&1 || true
+
+install -d -m 0755 /etc/apt/keyrings
+
+if wget -qO- "https://packages.mozilla.org/apt/repo-signing-key.gpg" \
+    > /etc/apt/keyrings/packages.mozilla.org.asc; then
+
+    chmod 0644 /etc/apt/keyrings/packages.mozilla.org.asc
+
+    echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
+        > /etc/apt/sources.list.d/mozilla.list
+
+    printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' \
+        > /etc/apt/preferences.d/mozilla
+
+    apt-get update
+
+    if ! apt-get install -y firefox; then
+        echo "WARNING: Firefox installation failed."
+    fi
+
+else
+
+    echo "WARNING: Could not download Mozilla's signing key."
+    echo "Firefox was skipped."
+
 fi
 
 
@@ -1094,7 +1231,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[11/12] Installing optional components"
+echo "[12/13] Installing optional components"
 
 JD_DIR="/opt/jdownloader"
 
@@ -1228,7 +1365,7 @@ chmod 0755 /usr/local/bin/xrdp-session-reset
 # ----------------------------------------------------------
 
 echo
-echo "[12/12] Verifying installation"
+echo "[13/13] Verifying installation"
 
 INSTALL_OK=true
 
@@ -1275,7 +1412,13 @@ fi
 
 if command -v ss >/dev/null 2>&1; then
 
-    if ss -tln | grep -q ":${RDP_PORT}\b"; then
+    # The output is read into a variable first. In a pipe,
+    # "grep -q" exits at the first match and kills ss with
+    # SIGPIPE - which "set -o pipefail" reports as a failure,
+    # so the check could claim the port is closed when it is not.
+    LISTENING_SOCKETS="$(ss -tln)"
+
+    if [[ "$LISTENING_SOCKETS" =~ :${RDP_PORT}([[:space:]]|$) ]]; then
         echo "RDP port:     listening on $RDP_PORT"
     else
         echo "RDP port:     WARNING (nothing listening on $RDP_PORT yet)"
