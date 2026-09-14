@@ -367,6 +367,15 @@ User=$USERNAME
 Group=$USER_GROUP
 Environment=DISPLAY=:$DISPLAY_NUM
 Environment=XDG_RUNTIME_DIR=/run/user/$USER_UID
+
+# The package sets CAP_SYS_ADMIN and CAP_SYS_NICE on the
+# binary, but file capabilities are dropped for a service
+# running under User=. Without them Sunshine cannot raise
+# its thread priority and virtual input devices may fail.
+
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_NICE
+
 ExecStartPre=/bin/sleep 5
 ExecStart=/usr/bin/sunshine
 Restart=always
