@@ -13,6 +13,9 @@
 #      +- sunshine-desktop.service   XFCE darauf
 #           +- sunshine-stream.service   Sunshine streamt ihn
 #
+#  Dazu eine virtuelle Tonausgabe ueber PipeWire, weil der
+#  Server keine Soundkarte hat und der Stream sonst stumm bliebe.
+#
 #  Der RDP-Zugang bleibt unberuehrt. Es entsteht eine ZWEITE
 #  Arbeitsflaeche neben der von RDP: gleiche Dateien, aber
 #  getrennt laufende Programme.
@@ -60,6 +63,10 @@ readonly GROESSTE_ANZEIGE=99
 
 # Wie lange auf einen startenden X-Server gewartet wird.
 readonly WARTEN_MAX_SEKUNDEN=40
+
+# Name der virtuellen Tonausgabe. Der Server hat keine Soundkarte;
+# ohne dieses Geraet bliebe der Stream stumm.
+readonly TON_GERAET="sunshine_sink"
 
 # Ordner fuer die getrennten Profile der Zweitstarter.
 # BEWUSST OHNE PUNKT am Anfang: Programme aus einem Snap-Paket (unter
@@ -343,7 +350,7 @@ mkdir -p "$SICHERUNG_ORDNER"
 # 1 - PAKETE
 # ----------------------------------------------------------
 
-schritt "[1/9] Pakete installieren"
+schritt "[1/10] Pakete installieren"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -374,7 +381,7 @@ apt-get install -y \
 # und wuerden mit der naechsten Ausgabe nicht mehr stimmen.
 # ----------------------------------------------------------
 
-schritt "[2/9] Sunshine installieren"
+schritt "[2/10] Sunshine installieren"
 
 if command -v sunshine >/dev/null 2>&1; then
 
@@ -405,7 +412,7 @@ systemctl --global disable \
 # modules-load.d sorgt dafuer, dass es den Neustart uebersteht.
 # ----------------------------------------------------------
 
-schritt "[3/9] Eingabegeraete vorbereiten"
+schritt "[3/10] Eingabegeraete vorbereiten"
 
 modprobe uinput 2>/dev/null || true
 
@@ -440,7 +447,7 @@ fi
 # gelesen und koennte den RDP-Zugang zerstoeren.
 # ----------------------------------------------------------
 
-schritt "[4/9] Bildschirm einrichten"
+schritt "[4/10] Bildschirm einrichten"
 
 sichern "$XORG_KONFIG"
 
@@ -562,10 +569,121 @@ fi
 
 
 # ----------------------------------------------------------
-# 5 - DIENSTE
+# 5 - TON
+#
+# Der Server hat keine Soundkarte. Ohne Tonsystem und ohne ein
+# Ausgabegeraet haetten Programme nichts, wohin sie ausgeben
+# koennen, und Sunshine nichts aufzunehmen - der Stream waere
+# stumm.
+#
+# PipeWire liefert beides: das Tonsystem und eine virtuelle
+# Ausgabe. Weil sie das einzige Ausgabegeraet ist, wird sie von
+# allein zur Standardausgabe; Programme finden sie also ohne
+# weiteres Zutun.
 # ----------------------------------------------------------
 
-schritt "[5/9] Dienste anlegen"
+schritt "[5/10] Ton einrichten"
+
+apt-get install -y \
+    pipewire \
+    pipewire-pulse \
+    wireplumber \
+    pulseaudio-utils
+
+# systemctl und pactl im Namen des Benutzers aufrufen. Beide brauchen
+# dessen Laufzeitverzeichnis, sonst finden sie seine Dienste nicht.
+#
+# runuser statt sudo: es gehoert zu util-linux und ist auf jedem System
+# vorhanden, waehrend sudo ein eigenes Paket ist.
+als_benutzer() {
+    runuser -u "$BENUTZER" -- env \
+        XDG_RUNTIME_DIR="/run/user/$BENUTZER_UID" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$BENUTZER_UID/bus" \
+        "$@"
+}
+
+# Die virtuelle Ausgabe dauerhaft anlegen. Ein "pactl load-module" waere
+# nach dem naechsten Neustart wieder verschwunden.
+PIPEWIRE_KONFIG_ORDNER="$BENUTZER_HEIM/.config/pipewire/pipewire.conf.d"
+
+mkdir -p "$PIPEWIRE_KONFIG_ORDNER"
+
+cat > "$PIPEWIRE_KONFIG_ORDNER/99-sunshine-sink.conf" <<EOF
+# Virtuelle Tonausgabe fuer Sunshine.
+# Angelegt am $(date '+%d.%m.%Y %H:%M').
+context.objects = [
+    {   factory = adapter
+        args = {
+            factory.name     = support.null-audio-sink
+            node.name        = "$TON_GERAET"
+            node.description = "Sunshine Ton"
+            media.class      = Audio/Sink
+            object.linger    = true
+            audio.position   = [ FL FR ]
+        }
+    }
+]
+EOF
+
+chown -R "$BENUTZER:$BENUTZER_GRUPPE" "$BENUTZER_HEIM/.config/pipewire"
+
+# Die Tondienste des Benutzers einschalten. Der Zusatz add-wants ist
+# noetig, weil sie sonst an graphical-session.target haengen - und das
+# wird nie erreicht, wenn die Arbeitsflaeche als Systemdienst laeuft.
+for TON_DIENST in pipewire.socket pipewire-pulse.socket wireplumber.service; do
+    als_benutzer systemctl --user enable "$TON_DIENST" >/dev/null 2>&1 || true
+done
+
+for TON_DIENST in pipewire.service pipewire-pulse.service wireplumber.service; do
+    als_benutzer systemctl --user add-wants default.target "$TON_DIENST" \
+        >/dev/null 2>&1 || true
+done
+
+als_benutzer systemctl --user daemon-reload >/dev/null 2>&1 || true
+
+for TON_DIENST in pipewire pipewire-pulse wireplumber; do
+    als_benutzer systemctl --user restart "$TON_DIENST" >/dev/null 2>&1 || true
+done
+
+# PipeWire braucht einen Moment, bis das Geraet steht.
+sleep 4
+
+TON_GERAETE="$(als_benutzer pactl list short sinks 2>/dev/null || true)"
+
+if [[ "$TON_GERAETE" == *"$TON_GERAET"* ]]; then
+    hinweis "Tonausgabe '$TON_GERAET' ist da."
+else
+    warnung "Tonausgabe '$TON_GERAET' noch nicht sichtbar."
+    warnung "Nach einem Neustart des Servers sollte sie erscheinen."
+fi
+
+# Sunshine sagen, welche Ausgabe es aufnehmen soll.
+SUNSHINE_KONFIG="$BENUTZER_HEIM/.config/sunshine/sunshine.conf"
+
+mkdir -p "$(dirname "$SUNSHINE_KONFIG")"
+
+if [[ ! -f "$SUNSHINE_KONFIG" ]]; then
+    : > "$SUNSHINE_KONFIG"
+fi
+
+sichern "$SUNSHINE_KONFIG"
+
+if grep -q '^audio_sink' "$SUNSHINE_KONFIG"; then
+    sed -i "s/^audio_sink.*/audio_sink = $TON_GERAET/" "$SUNSHINE_KONFIG"
+else
+    printf 'audio_sink = %s\n' "$TON_GERAET" >> "$SUNSHINE_KONFIG"
+fi
+
+chown -R "$BENUTZER:$BENUTZER_GRUPPE" "$BENUTZER_HEIM/.config/sunshine"
+
+hinweis "In sunshine.conf eingetragen: audio_sink = $TON_GERAET"
+
+
+# ----------------------------------------------------------
+# 6 - DIENSTE
+# ----------------------------------------------------------
+
+schritt "[6/10] Dienste anlegen"
 
 # Ein frueherer Aufbau mit Xvfb wuerde sich um dieselbe Anzeige streiten.
 if [[ -f "$DIENST_ORDNER/sunshine-xvfb.service" ]]; then
@@ -669,7 +787,7 @@ hinweis "sunshine-xorg, sunshine-desktop, sunshine-stream angelegt."
 
 
 # ----------------------------------------------------------
-# 6 - FIREWALL
+# 7 - FIREWALL
 #
 # Moonlight braucht:
 #   TCP 47984 (Kopplung), 47989 (Steuerung), 48010 (RTSP)
@@ -680,7 +798,7 @@ hinweis "sunshine-xorg, sunshine-desktop, sunshine-stream angelegt."
 # Sie wird vom Server selbst aus bedient.
 # ----------------------------------------------------------
 
-schritt "[6/9] Firewall einrichten"
+schritt "[7/10] Firewall einrichten"
 
 if ! command -v ufw >/dev/null 2>&1; then
 
@@ -720,10 +838,10 @@ fi
 
 
 # ----------------------------------------------------------
-# 7 - STARTEN
+# 8 - STARTEN
 # ----------------------------------------------------------
 
-schritt "[7/9] Dienste starten"
+schritt "[8/10] Dienste starten"
 
 systemctl enable --now sunshine-xorg >/dev/null 2>&1
 
@@ -742,14 +860,14 @@ sleep 8
 
 
 # ----------------------------------------------------------
-# 8 - ABNAHME
+# 9 - ABNAHME
 #
 # Der Beweis wird selbst erzeugt: ein eigenes uinput-Geraet.
 # Taucht es in der Geraeteliste auf, nimmt der Bildschirm
 # Eingaben an - ohne dass jemand streamen muss.
 # ----------------------------------------------------------
 
-schritt "[8/9] Abnahme"
+schritt "[9/10] Abnahme"
 
 ALLES_GUT=true
 
@@ -798,9 +916,19 @@ fi
 kill "$TEST_PROZESS" 2>/dev/null || true
 wait "$TEST_PROZESS" 2>/dev/null || true
 
+# Ton gegenpruefen. Ohne Ausgabegeraet bleibt der Stream stumm.
+TON_GERAETE_JETZT="$(als_benutzer pactl list short sinks 2>/dev/null || true)"
+
+if [[ "$TON_GERAETE_JETZT" == *"$TON_GERAET"* ]]; then
+    hinweis "Ton-Test:    BESTANDEN ($TON_GERAET vorhanden)"
+else
+    hinweis "Ton-Test:    Ausgabe '$TON_GERAET' fehlt noch"
+    warnung "Kein Abbruch - das gibt sich oft nach einem Neustart."
+fi
+
 
 # ----------------------------------------------------------
-# 9 - ZWEITSTARTER
+# 10 - ZWEITSTARTER
 #
 # Programme wie Browser lassen je Benutzer nur eine Instanz
 # zu. Laeuft schon eine auf der RDP-Flaeche, reicht ein zweiter
@@ -810,7 +938,7 @@ wait "$TEST_PROZESS" 2>/dev/null || true
 # Abhilfe ist ein eigenes Profilverzeichnis je Programm.
 # ----------------------------------------------------------
 
-schritt "[9/9] Starter fuer zweite Sitzungen"
+schritt "[10/10] Starter fuer zweite Sitzungen"
 
 if [[ "$STARTER_ANLEGEN" != true ]]; then
 
@@ -981,6 +1109,9 @@ echo "   journalctl -u sunshine-stream -n 50 --no-pager"
 echo
 echo "   Geraete waehrend einer Verbindung ansehen:"
 echo "     DISPLAY=:$ANZEIGE_NUMMER xinput list"
+echo
+echo "   Tonausgabe pruefen (als $BENUTZER):"
+echo "     XDG_RUNTIME_DIR=/run/user/$BENUTZER_UID pactl list short sinks"
 echo
 echo " ALLES WIEDER ENTFERNEN"
 echo "   systemctl disable --now sunshine-stream sunshine-desktop sunshine-xorg"
