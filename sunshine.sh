@@ -152,6 +152,33 @@ wait_for_screen() {
     return 1
 }
 
+# Checks an IPv4 address properly: the pattern alone would let
+# 999.999.999.999 through, and that would end up as a firewall rule
+# that quietly blocks everything. Same function as in install.sh.
+is_valid_ipv4() {
+    local ip="$1"
+    local octet
+    local -a octets
+
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+
+    IFS='.' read -r -a octets <<< "$ip"
+
+    [[ "${#octets[@]}" -eq 4 ]] || return 1
+
+    for octet in "${octets[@]}"; do
+
+        [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+
+        if (( 10#$octet > 255 )); then
+            return 1
+        fi
+
+    done
+
+    return 0
+}
+
 
 # ----------------------------------------------------------
 # PRE-FLIGHT CHECKS
@@ -177,6 +204,20 @@ source /etc/os-release
 
 if [[ "${ID:-}" != "ubuntu" ]]; then
     echo "ERROR: This script is written for Ubuntu." >&2
+    exit 1
+fi
+
+# The header promises 20.04 and newer, so check it instead of
+# failing later on a missing package. Same check as in install.sh.
+UBUNTU_VERSION="${VERSION_ID:-}"
+
+if [[ -z "$UBUNTU_VERSION" ]]; then
+    echo "ERROR: Unable to determine the Ubuntu version." >&2
+    exit 1
+fi
+
+if ! dpkg --compare-versions "$UBUNTU_VERSION" ge "20.04"; then
+    echo "ERROR: Ubuntu 20.04 or newer is required." >&2
     exit 1
 fi
 
@@ -303,7 +344,7 @@ if [[ "$ANSWER_FIREWALL" =~ ^[JjYy]$ ]]; then
         read -rp "Allowed public IPv4 address: " \
             ALLOWED_IP < /dev/tty
 
-        if [[ "$ALLOWED_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+        if is_valid_ipv4 "$ALLOWED_IP"; then
             break
         fi
 
