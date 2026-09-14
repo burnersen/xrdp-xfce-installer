@@ -128,8 +128,14 @@ is_valid_ipv4() {
 
 # Set a key in an INI style file.
 #
-# Replaces the active key, uncomments a commented key,
-# or appends the key if it is missing entirely.
+# Replaces the FIRST active key, uncomments the first
+# commented key, or appends the key if it is missing.
+#
+# Only the first occurrence is touched on purpose.
+# xrdp.ini contains several "port=" lines: the listening
+# port in [Globals], plus per-module values such as
+# "port=-1" and "port=ask3389". Replacing all of them
+# breaks the session backend.
 
 set_ini_key() {
 
@@ -144,7 +150,7 @@ set_ini_key() {
 
     if grep -qE "^[[:space:]]*${key}=" "$file"; then
 
-        sed -i -E "s|^[[:space:]]*${key}=.*|${key}=${value}|" "$file"
+        sed -i -E "0,/^[[:space:]]*${key}=.*/s||${key}=${value}|" "$file"
 
     elif grep -qE "^[[:space:]]*[;#][[:space:]]*${key}=" "$file"; then
 
