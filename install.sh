@@ -128,6 +128,53 @@ is_valid_ipv4() {
 }
 
 
+# Validate an IPv4 or IPv6 address, or a CIDR range.
+#
+# Prints the normalised value on success, returns 1 on
+# failure. A CIDR range matters for IPv6: many consumer
+# lines keep a stable prefix while the suffix changes, so
+# allowing 2001:db8:1234:5678::/64 keeps working where a
+# single address would not.
+#
+# Parsing is done with Python's ipaddress module, which
+# handles every IPv6 notation correctly. Writing that in
+# Bash reliably is not realistic. Without Python the
+# script falls back to IPv4 only.
+
+normalise_ip() {
+
+    local value="$1"
+
+    if command -v python3 >/dev/null 2>&1; then
+
+        python3 - "$value" <<'PYTHON'
+import ipaddress
+import sys
+
+value = sys.argv[1].strip()
+
+try:
+    if "/" in value:
+        print(ipaddress.ip_network(value, strict=False).with_prefixlen)
+    else:
+        print(ipaddress.ip_address(value))
+except ValueError:
+    sys.exit(1)
+PYTHON
+
+        return $?
+
+    fi
+
+    if is_valid_ipv4 "$value"; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    return 1
+}
+
+
 # Set a key in an INI style file.
 #
 # Replaces the FIRST active key, uncomments the first
@@ -277,27 +324,49 @@ fi
 echo
 
 read -rp \
-    "Restrict RDP access to one IPv4 address? [Y/n]: " \
+    "Restrict RDP access to one address or range? [Y/n]: " \
     LIMIT_RDP < /dev/tty
 
 LIMIT_RDP="${LIMIT_RDP:-Y}"
 
 if [[ "$LIMIT_RDP" =~ ^[Yy]$ ]]; then
 
+    echo
+    echo "IPv4 and IPv6 are both accepted, as a single"
+    echo "address or as a CIDR range."
+    echo
+    echo "  203.0.113.10"
+    echo "  2001:db8:1234:5678::1"
+    echo "  2001:db8:1234:5678::/64"
+    echo
+    echo "A range is useful on connections where only the"
+    echo "suffix changes but the prefix stays the same."
+    echo
+
     while true; do
 
         read -rp \
-            "Enter allowed public IPv4 address: " \
-            ALLOWED_IP < /dev/tty
+            "Enter allowed address or range: " \
+            ALLOWED_IP_RAW < /dev/tty
 
-        if is_valid_ipv4 "$ALLOWED_IP"; then
+        if ALLOWED_IP="$(normalise_ip "$ALLOWED_IP_RAW")"; then
             break
         fi
 
-        echo "ERROR: Invalid IPv4 address."
-        echo "Example: 203.0.113.10"
+        echo "ERROR: Not a valid address or range."
 
     done
+
+    # Everything not covered by the rule below stays denied,
+    # including the other address family. Restricting to an
+    # IPv4 address therefore blocks IPv6 access entirely,
+    # and the other way round.
+
+    if [[ "$ALLOWED_IP" == *:* ]]; then
+        echo "NOTE: This is an IPv6 rule. IPv4 clients will be blocked."
+    else
+        echo "NOTE: This is an IPv4 rule. IPv6 clients will be blocked."
+    fi
 
     MIN_PASSWORD_LENGTH=8
 
@@ -425,7 +494,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[1/13] Configuring DNS resolvers"
+echo "[1/15] Configuring DNS resolvers"
 
 readonly DNS_PRIMARY="1.1.1.1"
 readonly DNS_SECONDARY="8.8.8.8"
@@ -514,7 +583,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[2/13] Updating system"
+echo "[2/15] Updating system"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -527,7 +596,7 @@ apt-get upgrade -y
 # ----------------------------------------------------------
 
 echo
-echo "[3/13] Installing XFCE, XRDP and dependencies"
+echo "[3/15] Installing XFCE, XRDP and dependencies"
 
 apt-get install -y \
     sudo \
@@ -621,7 +690,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[4/13] Configuring XRDP"
+echo "[4/15] Configuring XRDP"
 
 if getent group ssl-cert >/dev/null 2>&1; then
     usermod -aG ssl-cert xrdp
@@ -669,7 +738,7 @@ set_ini_key "$XRDP_INI" "max_bpp" "24"
 # ----------------------------------------------------------
 
 echo
-echo "[5/13] Configuring persistent sessions"
+echo "[5/15] Configuring persistent sessions"
 
 set_ini_key "$SESMAN_INI" "Policy" "Default"
 set_ini_key "$SESMAN_INI" "KillDisconnected" "false"
@@ -692,7 +761,7 @@ systemctl restart xrdp
 # ----------------------------------------------------------
 
 echo
-echo "[6/13] Configuring user '$USERNAME'"
+echo "[6/15] Configuring user '$USERNAME'"
 
 if [[ "$USER_EXISTS" == false ]]; then
 
@@ -743,7 +812,7 @@ USER_GROUP="$(id -gn "$USERNAME")"
 # ----------------------------------------------------------
 
 echo
-echo "[7/13] Configuring XFCE session"
+echo "[7/15] Configuring XFCE session"
 
 cat > "$HOME_DIR/.xsession" <<'EOF'
 exec startxfce4
@@ -763,7 +832,7 @@ chmod 0644 "$HOME_DIR/.xsession"
 # ----------------------------------------------------------
 
 echo
-echo "[8/13] Configuring polkit for XRDP"
+echo "[8/15] Configuring polkit for XRDP"
 
 if command -v pkaction >/dev/null 2>&1; then
 
@@ -856,7 +925,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[9/13] Configuring UFW"
+echo "[9/15] Configuring UFW"
 
 declare -a SSH_PORTS=()
 
@@ -1052,7 +1121,7 @@ ufw --force enable
 # ----------------------------------------------------------
 
 echo
-echo "[10/13] Configuring fail2ban"
+echo "[10/15] Configuring fail2ban"
 
 SESMAN_LOG="/var/log/xrdp-sesman.log"
 
@@ -1110,7 +1179,7 @@ systemctl restart fail2ban
 # ----------------------------------------------------------
 
 echo
-echo "[11/13] Installing browsers"
+echo "[11/15] Installing browsers"
 
 
 # ----------------------------------------------------------
@@ -1231,7 +1300,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[12/13] Installing optional components"
+echo "[12/15] Installing optional components"
 
 JD_DIR="/opt/jdownloader"
 
@@ -1361,11 +1430,135 @@ chmod 0755 /usr/local/bin/xrdp-session-reset
 
 
 # ----------------------------------------------------------
+# SWAP
+#
+# A small VPS can run out of memory during archive
+# extraction or a browser session, and the kernel then
+# kills the largest process without warning.
+#
+# Swap is a safety net, not a speed improvement. With
+# swappiness lowered it stays unused until memory is
+# actually tight.
+# ----------------------------------------------------------
+
+echo
+echo "[13/15] Configuring swap"
+
+if swapon --show --noheadings 2>/dev/null | grep -q .; then
+
+    echo "Swap is already active, leaving it unchanged:"
+    swapon --show
+
+elif [[ -e /swapfile ]]; then
+
+    echo "WARNING: /swapfile exists but is not active."
+    echo "Skipping to avoid touching an unknown file."
+
+else
+
+    # Half the installed memory, clamped to 2-8 GB.
+
+    MEM_MB="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)"
+    SWAP_GB=$(( MEM_MB / 2048 ))
+
+    (( SWAP_GB < 2 )) && SWAP_GB=2
+    (( SWAP_GB > 8 )) && SWAP_GB=8
+
+    # Only proceed if there is clearly enough room.
+
+    FREE_GB="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
+
+    if (( FREE_GB < SWAP_GB + 5 )); then
+
+        echo "WARNING: Not enough free disk space for a ${SWAP_GB}G swap file."
+        echo "Skipping swap configuration."
+
+    else
+
+        echo "Creating a ${SWAP_GB}G swap file..."
+
+        if fallocate -l "${SWAP_GB}G" /swapfile 2>/dev/null ||
+           dd if=/dev/zero of=/swapfile bs=1M count=$(( SWAP_GB * 1024 )) status=none; then
+
+            chmod 0600 /swapfile
+            mkswap /swapfile >/dev/null
+            swapon /swapfile
+
+            if ! grep -q '^/swapfile' /etc/fstab; then
+                cp /etc/fstab /etc/fstab.orig
+                printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
+            fi
+
+            # Use swap only when memory is genuinely short.
+
+            printf 'vm.swappiness=10\n' > /etc/sysctl.d/99-swappiness.conf
+            sysctl -p /etc/sysctl.d/99-swappiness.conf >/dev/null
+
+            echo "Swap active:"
+            swapon --show
+
+        else
+
+            echo "WARNING: Could not create the swap file."
+            rm -f /swapfile
+
+        fi
+
+    fi
+
+fi
+
+
+# ----------------------------------------------------------
+# AUTOMATIC SECURITY UPDATES
+#
+# The one-time upgrade earlier in this script covers the
+# moment of installation only. This keeps security patches
+# coming in afterwards.
+#
+# Only the security pocket is enabled, and the machine is
+# never rebooted automatically.
+# ----------------------------------------------------------
+
+echo
+echo "[14/15] Enabling automatic security updates"
+
+if ! apt-get install -y unattended-upgrades; then
+
+    echo "WARNING: Could not install unattended-upgrades."
+
+else
+
+    cat > /etc/apt/apt.conf.d/20auto-upgrades <<'AUTOUPG'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+AUTOUPG
+
+    chmod 0644 /etc/apt/apt.conf.d/20auto-upgrades
+
+    # Never reboot on its own: an unattended reboot would
+    # drop every running RDP session without warning.
+
+    cat > /etc/apt/apt.conf.d/51-no-auto-reboot <<'NOREBOOT'
+Unattended-Upgrade::Automatic-Reboot "false";
+NOREBOOT
+
+    chmod 0644 /etc/apt/apt.conf.d/51-no-auto-reboot
+
+    systemctl enable --now unattended-upgrades 2>/dev/null || true
+
+    echo "Security updates will be installed automatically."
+    echo "Automatic reboots are disabled."
+
+fi
+
+
+# ----------------------------------------------------------
 # VERIFY
 # ----------------------------------------------------------
 
 echo
-echo "[13/13] Verifying installation"
+echo "[15/15] Verifying installation"
 
 INSTALL_OK=true
 
@@ -1502,6 +1695,13 @@ if [[ ! "$LIMIT_RDP" =~ ^[Yy]$ ]]; then
     echo " randomly generated password remains essential."
 fi
 
+echo
+if swapon --show --noheadings 2>/dev/null | grep -q .; then
+    echo " Swap is active. Check it with: swapon --show"
+fi
+
+echo " Security updates are installed automatically."
+echo " The server never reboots on its own."
 echo
 echo " Recommended: reboot before the first RDP login."
 echo
