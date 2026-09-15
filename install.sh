@@ -11,9 +11,15 @@ set -Eeuo pipefail
 #   - Persistent sessions (reconnect from any device/IP)
 #   - Custom RDP port
 #   - UFW firewall (SSH access is preserved)
+#   - RDP restricted to an IPv4/IPv6 address or CIDR range,
+#     or open after an explicit confirmation
 #   - fail2ban for SSH and XRDP
 #   - Fast DNS resolvers (the provider name servers are replaced)
+#   - Swap file, sized from the installed memory
+#   - Automatic security updates, without automatic reboots
+#   - FUSE 2, so AppImage applications start out of the box
 #   - Google Chrome and Firefox (Firefox from Mozilla APT, not Snap)
+#   - xrdp-session-reset helper for a stuck session
 #   - Optional: JDownloader 2 (desktop app or headless service)
 # ==========================================================
 
