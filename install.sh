@@ -20,7 +20,7 @@ set -Eeuo pipefail
 #   - Optional: JDownloader 2 (desktop app or headless service)
 # ==========================================================
 
-readonly INSTALLER_VERSION="2.1.0"
+readonly INSTALLER_VERSION="2.1.1"
 
 readonly DNS_PRIMARY="1.1.1.1"
 readonly DNS_SECONDARY="8.8.8.8"
@@ -1998,14 +1998,73 @@ if [[ "\$EUID" -ne 0 ]]; then
     exit 1
 fi
 
-echo "Terminating all processes of user '$USERNAME'..."
+echo "Terminating the RDP session processes of user '$USERNAME'..."
 
-pkill -u "$USERNAME" || true
-sleep 2
+# Processes that must SURVIVE: the Sunshine setup from sunshine.sh
+# (its own screen, desktop and stream) and the user's own systemd
+# instance, which is where PipeWire runs.
+#
+# systemd keeps every process of a unit in that unit's own cgroup, so
+# the list below is exact - no guessing by process name. Sub-cgroups
+# are included, which is how the services under user@<UID>.service are
+# found. If none of these paths exist - no Sunshine, or an older
+# cgroup layout - the list stays empty and everything is terminated,
+# exactly as before.
+declare -A SPARED_PIDS=()
 
-# Anything that ignored the polite request.
-pkill -KILL -u "$USERNAME" || true
-sleep 1
+collect_pids() {
+    local procs_file="\$1"
+    local pid
+
+    [[ -r "\$procs_file" ]] || return 0
+
+    while read -r pid; do
+        if [[ -n "\$pid" ]]; then
+            SPARED_PIDS["\$pid"]=1
+        fi
+    done < "\$procs_file"
+}
+
+TARGET_UID="\$(id -u '$USERNAME')"
+
+for CGROUP_BASE in \\
+    /sys/fs/cgroup/system.slice/sunshine-xorg.service \\
+    /sys/fs/cgroup/system.slice/sunshine-desktop.service \\
+    /sys/fs/cgroup/system.slice/sunshine-stream.service \\
+    "/sys/fs/cgroup/user.slice/user-\${TARGET_UID}.slice/user@\${TARGET_UID}.service"
+do
+
+    [[ -d "\$CGROUP_BASE" ]] || continue
+
+    while read -r PROCS_FILE; do
+        collect_pids "\$PROCS_FILE"
+    done < <(find "\$CGROUP_BASE" -name cgroup.procs 2>/dev/null)
+
+done
+
+if (( \${#SPARED_PIDS[@]} > 0 )); then
+    echo "Sparing \${#SPARED_PIDS[@]} process(es) of the Sunshine setup."
+fi
+
+# Two rounds: first the polite request, then the hammer for whatever
+# ignored it.
+for SIGNAL in TERM KILL; do
+
+    while read -r PID; do
+
+        [[ -n "\$PID" ]] || continue
+
+        if [[ -n "\${SPARED_PIDS[\$PID]:-}" ]]; then
+            continue
+        fi
+
+        kill "-\$SIGNAL" "\$PID" 2>/dev/null || true
+
+    done < <(pgrep -u "$USERNAME" || true)
+
+    sleep 2
+
+done
 
 echo "Removing orphaned X server sockets..."
 
@@ -2018,8 +2077,13 @@ for SOCKET in /tmp/.X11-unix/X*; do
     [[ "\$DISPLAY_NUMBER" =~ ^[0-9]+\$ ]] || continue
 
     # Still in use by a running X server? Then leave it alone.
+    #
+    # "> /dev/null" instead of "grep -q": with -q, grep exits at the
+    # first match and can kill pgrep with SIGPIPE, which under
+    # "set -o pipefail" would turn a match into a false negative - and
+    # a socket that is still in use would be deleted.
     if pgrep -af 'X(org|vfb|vnc)' 2>/dev/null |
-       grep -qE "(^| ):\${DISPLAY_NUMBER}( |\\\$)"; then
+       grep -E "(^| ):\${DISPLAY_NUMBER}( |\\\$)" > /dev/null; then
         continue
     fi
 
@@ -2031,6 +2095,12 @@ systemctl restart xrdp-sesman
 systemctl restart xrdp
 
 echo "Done. Reconnect using <SERVER_IP>:$RDP_PORT"
+
+if [[ -x /usr/local/bin/sunshine-session-reset ]]; then
+    echo
+    echo "The Sunshine desktop was left running on purpose."
+    echo "To reset that one as well:  sunshine-session-reset"
+fi
 EOF
 
 chmod 0755 /usr/local/bin/xrdp-session-reset

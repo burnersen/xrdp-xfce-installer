@@ -4,7 +4,7 @@ Interactive installer for a XFCE remote desktop on Ubuntu, with persistent sessi
 
 The script installs a lightweight XFCE desktop, makes it reachable over RDP, creates a non-root sudo user, installs browsers and secures the server. It is written for clean Ubuntu installations, for example on a fresh VPS.
 
-Two optional companion scripts complete the setup: `german.sh` for a German system, and `sunshine.sh` for a second desktop that can be streamed with Moonlight.
+Two optional companion scripts complete the setup: `german.sh` for a German system, and `sunshine.sh` for a second desktop that can be streamed with Moonlight. Run them in that order — `install.sh`, then `german.sh`, then `sunshine.sh` — so the streamed desktop comes up with the right language and keyboard from its very first start.
 
 ---
 
@@ -35,7 +35,7 @@ Two optional companion scripts complete the setup: `german.sh` for a German syst
 - Firefox from Mozilla's APT repository instead of the Snap build
 - FUSE 2, so AppImage applications start without further setup
 - Optional JDownloader 2, either as a desktop application or as a systemd service
-- `xrdp-session-reset` helper command for the rare case of a stuck session
+- `xrdp-session-reset` helper command for the rare case of a stuck session. It spares a Sunshine desktop if one is installed, so resetting RDP does not cost you the Moonlight session
 
 ---
 
@@ -284,7 +284,13 @@ bash german.sh
 
 It sets the system locale to `de_DE.UTF-8`, the time zone to Europe/Berlin, the keyboard layout for console and X11, the session language for one user, and installs the German language pack for Firefox if Mozilla's repository is present.
 
+The **English names of the home directories are kept** — `Downloads` does not become `Downloads`, `Documents` does not become `Dokumente`. Renaming them would break every path another application has stored. This needs more than the `user-dirs.locale` file that most guides mention: that file is only a marker recording which language was used last, and the difference to the running language is exactly what triggers the renaming. The script therefore sets `enabled=False` in `user-dirs.conf`, the documented off switch.
+
 The language applies when a session **starts**. A session that is already running keeps the old language, so reboot or log out inside XFCE and reconnect.
+
+**XRDP is deliberately not restarted.** Restarting it would cut every RDP connection currently open — including the one the script may be running in — without making the language take effect any sooner.
+
+Run this **before** `sunshine.sh`. Both the session language and `/etc/default/keyboard` are picked up by a desktop when it starts, and a keyboard change only becomes visible to an X server that is already running after a reboot. Running it afterwards works too, but then reboot, or run `sunshine-session-reset`, to bring the streamed desktop across.
 
 ---
 
@@ -304,6 +310,10 @@ sunshine-xorg      Xorg with the dummy driver on display :20
 sunshine-desktop   XFCE running on that display
 sunshine-stream    Sunshine capturing and streaming it
 ```
+
+The streamed desktop follows the **system language**: it reads `/etc/default/locale`, the file `localectl` writes, so it comes up German once `german.sh` has run and stays English otherwise. It cannot use `~/.xsessionrc`, because the desktop is started directly and never passes through `/etc/X11/Xsession`.
+
+Running the script a **second time** is fine. If display `:20` is still held by its own services, it says so and offers to stop them first; a display held by anything else is still refused.
 
 **Xorg with the dummy driver, not Xvfb.** This is the single most important detail. Xvfb accepts no input devices at all: Sunshine creates its mouse and keyboard as virtual `uinput` devices the moment a client connects, and under Xvfb those are silently discarded. The picture arrives, nothing can be operated. A real X server picks them up through udev. For the same reason `AutoAddDevices` must stay at `true`, although many headless guides recommend turning it off.
 
@@ -332,17 +342,32 @@ Two limitations worth knowing:
 
 ---
 
-## When RDP does not respond
+## When a desktop does not respond
 
-A stuck window manager can leave a session that refuses new connections. SSH still works, so run:
+A stuck window manager can leave a session that refuses new connections. SSH still works, so there is a reset command for each desktop. Each one repairs its own half and leaves the other alone:
+
+| Command | Terminates | Leaves alone | Installed by |
+|---|---|---|---|
+| `xrdp-session-reset` | the RDP session processes | Sunshine, PipeWire | `install.sh` |
+| `sunshine-session-reset` | the three `sunshine-*` services | every RDP session | `sunshine.sh` |
+
+If everything is stuck at once, run both — one after the other.
 
 ```bash
 xrdp-session-reset
 ```
 
-This terminates **all** processes of the RDP user - not only the stuck session - and restarts both XRDP services. Reconnecting then gives a fresh desktop.
+This terminates the RDP session processes of the desktop user and restarts both XRDP services. Reconnecting then gives a fresh desktop.
 
 It also removes the socket and lock file an X server leaves behind, because a new session on the same display number cannot start while they are there. Only displays with no X server still running are cleaned up, so a display belonging to another service is never touched.
+
+Which processes belong to Sunshine is read from the systemd control groups of its services, not guessed from process names. Without `sunshine.sh` installed there is nothing to spare and every process of the user is terminated, exactly as before.
+
+```bash
+sunshine-session-reset
+```
+
+This stops the three Sunshine services in reverse order, clears a leftover socket on their display, and starts them again — waiting for the screen to answer instead of guessing a delay. It prints the state of all three at the end.
 
 If SSH is unreachable as well, use the provider's web console. Most VPS providers offer one, and it works independently of the network configuration.
 

@@ -13,6 +13,10 @@
 #      +- sunshine-desktop.service   XFCE on it
 #           +- sunshine-stream.service   Sunshine streaming it
 #
+#  Plus the command "sunshine-session-reset", which restarts exactly
+#  those three and leaves the RDP sessions alone. Its counterpart
+#  from install.sh, "xrdp-session-reset", does the opposite.
+#
 #  Plus a virtual audio output over PipeWire, because the
 #  server has no sound card and the stream would be silent.
 #
@@ -51,6 +55,8 @@ set -Eeuo pipefail
 # CONSTANTS
 # ----------------------------------------------------------
 
+readonly SCRIPT_VERSION="1.1.0"
+
 readonly BACKUP_DIR="/root/setup-backup"
 readonly XORG_CONFIG="/etc/X11/xorg-dummy.conf"
 readonly XWRAPPER_CONFIG="/etc/X11/Xwrapper.config"
@@ -75,9 +81,24 @@ readonly AUDIO_SINK="sunshine_sink"
 readonly PROFILE_DIR_NAME="sunshine-profiles"
 
 
+# The three services this script builds. Named in start order;
+# stopping walks the list backwards.
+readonly SERVICE_NAMES=(sunshine-xorg sunshine-desktop sunshine-stream)
+
+# Helper the user can call later to restart just this setup.
+readonly RESET_COMMAND="/usr/local/bin/sunshine-session-reset"
+
+
 # ----------------------------------------------------------
 # ERROR HANDLING
+#
+# Only what makes the stream unusable is fatal - the screen, the
+# services and Sunshine itself. Everything else records a warning
+# and the setup carries on, so one hiccup cannot leave a half
+# configured server behind. All warnings are listed again at the end.
 # ----------------------------------------------------------
+
+declare -a WARNINGS=()
 
 on_error() {
     local exit_code=$?
@@ -119,6 +140,31 @@ note() {
 
 warn() {
     echo "    NOTE: $*"
+    WARNINGS+=("$*")
+}
+
+# Runs a command on behalf of the desktop user. Both systemctl --user
+# and pactl need that user's runtime directory, or they will not find
+# their services.
+#
+# runuser instead of sudo: it belongs to util-linux and is present on
+# every system, while sudo is a separate package.
+as_user() {
+    runuser -u "$USERNAME" -- env \
+        XDG_RUNTIME_DIR="/run/user/$USER_UID" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" \
+        "$@"
+}
+
+# Creates a directory in the user's home AS that user.
+#
+# A plain "mkdir -p" run as root creates every missing level as root,
+# so a first call for ~/.config/sunshine would leave ~/.config itself
+# owned by root - and a root owned ~/.config stops the whole desktop
+# from starting. Letting the user create them gets the ownership right
+# without any chown at all.
+make_user_dir() {
+    runuser -u "$USERNAME" -- mkdir -p "$1"
 }
 
 backup_file() {
@@ -234,7 +280,7 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 readonly TIMESTAMP
 
 echo "=================================================="
-echo " Set up Sunshine with a desktop of its own"
+echo " Set up Sunshine with a desktop of its own $SCRIPT_VERSION"
 echo "=================================================="
 echo
 echo " System:       ${PRETTY_NAME:-Ubuntu}"
@@ -305,9 +351,61 @@ if (( DISPLAY_NUM < MIN_DISPLAY || DISPLAY_NUM > MAX_DISPLAY )); then
     exit 1
 fi
 
+# A display that is already in use is usually THIS setup from an
+# earlier run. Refusing outright would make the script impossible to
+# run a second time, so its own services are offered for a restart -
+# while anything else on that display is still a hard stop.
 if [[ -e "/tmp/.X11-unix/X${DISPLAY_NUM}" ]]; then
-    echo "ERROR: Display :$DISPLAY_NUM is already in use." >&2
-    exit 1
+
+    if systemctl is-active --quiet sunshine-xorg.service; then
+
+        echo
+        echo "Display :$DISPLAY_NUM is in use by sunshine-xorg.service,"
+        echo "that is this script's own setup from an earlier run."
+        echo "Setting it up again stops the three services - an open"
+        echo "Moonlight session would be cut."
+        echo
+
+        read -rp "Stop them and set up again? [y/N]: " \
+            ANSWER_RESTART < /dev/tty
+
+        if ! [[ "${ANSWER_RESTART:-n}" =~ ^[JjYy]$ ]]; then
+            echo "Cancelled - nothing was changed." >&2
+            exit 1
+        fi
+
+        # Stopped in reverse order, so nothing is left looking for a
+        # screen that has already gone.
+        for (( INDEX = ${#SERVICE_NAMES[@]} - 1; INDEX >= 0; INDEX-- )); do
+            systemctl stop "${SERVICE_NAMES[INDEX]}.service" >/dev/null 2>&1 || true
+        done
+
+        # Give Xorg a moment to release the socket before the check below.
+        sleep 3
+
+    fi
+
+fi
+
+# Either it was never ours, or stopping it did not free the display.
+if [[ -e "/tmp/.X11-unix/X${DISPLAY_NUM}" ]]; then
+
+    # "> /dev/null" instead of "grep -q" on purpose: with -q, grep exits
+    # at the first match and can kill pgrep with SIGPIPE, which under
+    # "set -o pipefail" would turn a match into a false negative.
+    if pgrep -af 'X(org|vfb|vnc)' 2>/dev/null |
+       grep -E "(^| ):${DISPLAY_NUM}( |$)" > /dev/null; then
+
+        echo "ERROR: Display :$DISPLAY_NUM is in use by another X server." >&2
+        echo "Pick a different number, or stop that server first." >&2
+        exit 1
+
+    fi
+
+    # No X server on it any more - the socket is a leftover.
+    echo "Removing the leftover socket of display :$DISPLAY_NUM."
+    rm -f "/tmp/.X11-unix/X${DISPLAY_NUM}" "/tmp/.X${DISPLAY_NUM}-lock"
+
 fi
 
 readonly DISPLAY_NUM
@@ -333,7 +431,7 @@ echo
 read -rp "Restrict access to a single IPv4 address? [Y/n]: " \
     ANSWER_FIREWALL < /dev/tty
 
-ANSWER_FIREWALL="${ANSWER_FIREWALL:-J}"
+ANSWER_FIREWALL="${ANSWER_FIREWALL:-Y}"
 
 ALLOWED_IP=""
 
@@ -371,7 +469,7 @@ echo
 read -rp "Create such second-session launchers? [Y/n]: " \
     ANSWER_LAUNCHERS < /dev/tty
 
-ANSWER_LAUNCHERS="${ANSWER_LAUNCHERS:-J}"
+ANSWER_LAUNCHERS="${ANSWER_LAUNCHERS:-Y}"
 
 if [[ "$ANSWER_LAUNCHERS" =~ ^[JjYy]$ ]]; then
     CREATE_LAUNCHERS=true
@@ -395,14 +493,23 @@ step "[1/10] Installing packages"
 
 export DEBIAN_FRONTEND=noninteractive
 
-apt-get update
+# A single broken third party repository must not stop the setup
+# before anything has happened at all.
+if ! apt-get update; then
+    warn "'apt-get update' reported a problem - continuing with the package lists on disk."
+fi
 
 # xserver-xorg-video-dummy     the screen without a graphics card
 # xserver-xorg-input-libinput  so input devices are accepted
+# xserver-xorg-legacy          brings /usr/lib/xorg/Xorg.wrap, the ONLY
+#                              program that reads Xwrapper.config and the
+#                              reason a service user may start Xorg at all.
+#                              Without it sunshine-xorg.service cannot start.
 # x11-utils / xinput           for the checks at the end
 # python3-evdev                creates the test device for the acceptance check
 apt-get install -y \
     xserver-xorg-core \
+    xserver-xorg-legacy \
     xserver-xorg-video-dummy \
     xserver-xorg-input-libinput \
     x11-xserver-utils \
@@ -440,9 +547,18 @@ else
 fi
 
 # The bundled user service would look for whichever display it can
-# find. This setup uses its own services, so disable the bundled one.
-systemctl --global disable \
-    app-dev.lizardbyte.app.Sunshine.service >/dev/null 2>&1 || true
+# find. This setup uses its own services, so disable the bundled one -
+# two Sunshine instances would fight over ports 47984 and 47989.
+#
+# The package ships it under two names: the long one and the alias
+# "sunshine". Both have to go.
+#
+# --global only clears /etc/systemd/user. A user who enabled the
+# service by hand has their own link in the home directory; that one
+# is removed further down, once linger has created /run/user/<UID>.
+for BUNDLED_UNIT in app-dev.lizardbyte.app.Sunshine.service sunshine.service; do
+    systemctl --global disable "$BUNDLED_UNIT" >/dev/null 2>&1 || true
+done
 
 
 # ----------------------------------------------------------
@@ -629,23 +745,11 @@ apt-get install -y \
     wireplumber \
     pulseaudio-utils
 
-# Call systemctl and pactl on behalf of the user. Both need that
-# user's runtime directory, or they will not find their services.
-#
-# runuser instead of sudo: it belongs to util-linux and is present on
-# every system, while sudo is a separate package.
-as_user() {
-    runuser -u "$USERNAME" -- env \
-        XDG_RUNTIME_DIR="/run/user/$USER_UID" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" \
-        "$@"
-}
-
 # Create the virtual output permanently. A "pactl load-module" would
 # be gone again after the next reboot.
 PIPEWIRE_CONFIG_DIR="$USER_HOME/.config/pipewire/pipewire.conf.d"
 
-mkdir -p "$PIPEWIRE_CONFIG_DIR"
+make_user_dir "$PIPEWIRE_CONFIG_DIR"
 
 cat > "$PIPEWIRE_CONFIG_DIR/99-sunshine-sink.conf" <<EOF
 # Virtual audio output for Sunshine.
@@ -681,7 +785,11 @@ done
 as_user systemctl --user daemon-reload >/dev/null 2>&1 || true
 
 for AUDIO_SERVICE in pipewire pipewire-pulse wireplumber; do
-    as_user systemctl --user restart "$AUDIO_SERVICE" >/dev/null 2>&1 || true
+
+    if ! as_user systemctl --user restart "$AUDIO_SERVICE" >/dev/null 2>&1; then
+        warn "Audio service '$AUDIO_SERVICE' could not be started."
+    fi
+
 done
 
 # PipeWire needs a moment before the device shows up.
@@ -692,14 +800,14 @@ AUDIO_SINKS="$(as_user pactl list short sinks 2>/dev/null || true)"
 if [[ "$AUDIO_SINKS" == *"$AUDIO_SINK"* ]]; then
     note "Audio output '$AUDIO_SINK' is present."
 else
-    warn "Audio output '$AUDIO_SINK' not visible yet."
-    warn "It should appear after a reboot of the server."
+    note "Audio output '$AUDIO_SINK' not visible yet - it should"
+    note "appear after a reboot. Checked again further down."
 fi
 
 # Tell Sunshine which output to capture.
 SUNSHINE_CONFIG="$USER_HOME/.config/sunshine/sunshine.conf"
 
-mkdir -p "$(dirname "$SUNSHINE_CONFIG")"
+make_user_dir "$(dirname "$SUNSHINE_CONFIG")"
 
 if [[ ! -f "$SUNSHINE_CONFIG" ]]; then
     : > "$SUNSHINE_CONFIG"
@@ -727,7 +835,7 @@ step "[6/10] Creating services"
 # An earlier setup using Xvfb would fight over the same display.
 if [[ -f "$SERVICE_DIR/sunshine-xvfb.service" ]]; then
 
-    warn "Old Xvfb service found - it is being disabled."
+    note "Old Xvfb service found - it is being disabled."
     systemctl disable --now sunshine-xvfb >/dev/null 2>&1 || true
     mv "$SERVICE_DIR/sunshine-xvfb.service" \
        "$BACKUP_DIR/sunshine-xvfb.service.replaced.$TIMESTAMP"
@@ -745,9 +853,16 @@ for ATTEMPT in 1 2 3 4 5; do
 done
 
 if [[ ! -d "/run/user/$USER_UID" ]]; then
-    warn "/run/user/$USER_UID is missing - the desktop may"
-    warn "fail on its first start. Reboot the server if needed."
+    warn "/run/user/$USER_UID is missing - the desktop may fail on its first start. Reboot the server if needed."
 fi
+
+# Now that the user's own systemd instance is reachable, remove a
+# bundled Sunshine service the user may have enabled by hand. Left in
+# place it would start a second Sunshine and take the ports away from
+# the service built here.
+for BUNDLED_UNIT in app-dev.lizardbyte.app.Sunshine.service sunshine.service; do
+    as_user systemctl --user disable --now "$BUNDLED_UNIT" >/dev/null 2>&1 || true
+done
 
 cat > "$SERVICE_DIR/sunshine-xorg.service" <<EOF
 [Unit]
@@ -758,6 +873,14 @@ After=network.target
 Type=simple
 User=$USERNAME
 Group=$USER_GROUP
+
+# -nolisten tcp  the screen is reachable over the local socket only
+# -noreset       the screen survives the last client disconnecting
+# -ac            no access control. It is what lets root run the
+#                checks at the end of the setup without an Xauthority
+#                file. The price: any local user could connect to this
+#                display. On a single user server that is acceptable;
+#                on a shared machine it would not be.
 ExecStart=/usr/bin/Xorg :$DISPLAY_NUM -config $(basename "$XORG_CONFIG") -nolisten tcp -noreset -ac
 Restart=always
 RestartSec=5
@@ -778,6 +901,15 @@ User=$USERNAME
 Group=$USER_GROUP
 Environment=DISPLAY=:$DISPLAY_NUM
 Environment=XDG_RUNTIME_DIR=/run/user/$USER_UID
+
+# The desktop is started directly and therefore never runs through
+# /etc/X11/Xsession - which is the only thing that reads ~/.xsessionrc.
+# Without this line the session would always be English, even after a
+# localisation script has been run. /etc/default/locale is the file
+# localectl writes, so the language simply follows the system.
+# The leading "-" means: carry on if the file does not exist.
+EnvironmentFile=-/etc/default/locale
+
 ExecStartPre=/bin/sleep 3
 ExecStart=/usr/bin/dbus-launch --exit-with-session /usr/bin/xfce4-session
 Restart=always
@@ -823,6 +955,89 @@ chmod 0644 "$SERVICE_DIR"/sunshine-xorg.service \
 systemctl daemon-reload
 
 note "sunshine-xorg, sunshine-desktop, sunshine-stream created."
+
+
+# ----------------------------------------------------------
+# A RESET COMMAND OF ITS OWN
+#
+# Counterpart to xrdp-session-reset from install.sh. Each one
+# repairs its own half and leaves the other alone, so a stuck
+# RDP session no longer costs you the Moonlight session and
+# the other way round.
+# ----------------------------------------------------------
+
+cat > "$RESET_COMMAND" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Restarts THIS Sunshine setup and nothing else.
+# RDP sessions are deliberately not touched - use xrdp-session-reset
+# for those.
+
+if [[ "\$EUID" -ne 0 ]]; then
+    echo "Please run as root." >&2
+    exit 1
+fi
+
+echo "Stopping the Sunshine services..."
+
+# Reverse start order, so nothing is left looking for a screen that
+# has already gone.
+systemctl stop sunshine-stream.service  || true
+systemctl stop sunshine-desktop.service || true
+systemctl stop sunshine-xorg.service    || true
+
+sleep 2
+
+# A crashed Xorg leaves its socket and lock file behind, and the next
+# start on the same display number then fails. Removed only while no X
+# server is using the display any more.
+#
+# "> /dev/null" instead of "grep -q": with -q, grep exits at the first
+# match and can kill pgrep with SIGPIPE, which "set -o pipefail" would
+# report as a failure.
+if ! pgrep -af 'X(org|vfb|vnc)' 2>/dev/null |
+     grep -E '(^| ):$DISPLAY_NUM( |\$)' > /dev/null; then
+
+    rm -f /tmp/.X11-unix/X$DISPLAY_NUM /tmp/.X$DISPLAY_NUM-lock
+
+fi
+
+echo "Starting them again..."
+
+systemctl start sunshine-xorg.service
+
+# Wait for the screen to answer instead of guessing a sleep time.
+for (( SECOND = 1; SECOND <= 40; SECOND++ )); do
+
+    if DISPLAY=":$DISPLAY_NUM" xdpyinfo >/dev/null 2>&1; then
+        break
+    fi
+
+    printf '.'
+    sleep 1
+
+done
+
+echo
+
+systemctl start sunshine-desktop.service
+sleep 5
+systemctl start sunshine-stream.service
+sleep 5
+
+for SERVICE in sunshine-xorg sunshine-desktop sunshine-stream; do
+    printf '  %-18s %s\n' "\$SERVICE:" "\$(systemctl is-active "\$SERVICE.service" || true)"
+done
+
+echo
+echo "Done. Connect with Moonlight again."
+echo "RDP sessions were not touched."
+EOF
+
+chmod 0755 "$RESET_COMMAND"
+
+note "$(basename "$RESET_COMMAND") created."
 
 
 # ----------------------------------------------------------
@@ -882,7 +1097,9 @@ fi
 
 step "[8/10] Starting the services"
 
-systemctl enable --now sunshine-xorg >/dev/null 2>&1
+# Only the chatter on stdout is hidden. Error messages stay visible -
+# without them a failure here would abort with nothing to go on.
+systemctl enable --now sunshine-xorg >/dev/null
 
 note "Waiting for the screen"
 
@@ -892,9 +1109,9 @@ if ! wait_for_screen; then
     exit 1
 fi
 
-systemctl enable --now sunshine-desktop >/dev/null 2>&1
+systemctl enable --now sunshine-desktop >/dev/null
 sleep 6
-systemctl enable --now sunshine-stream >/dev/null 2>&1
+systemctl enable --now sunshine-stream >/dev/null
 sleep 8
 
 
@@ -924,8 +1141,11 @@ done
 # No "exit" in the awk and no "head": a reader that closes the pipe
 # early kills the writer with SIGPIPE (code 141), which together with
 # "set -o pipefail" would wrongly count as a failure.
-SCREEN_SIZE="$(DISPLAY=":$DISPLAY_NUM" xdpyinfo \
-    | awk '/dimensions:/ { print $2 }')"
+#
+# "|| true" so a hiccup while reading the screen size cannot abort the
+# whole setup at the very last step - the size is only informational.
+SCREEN_SIZE="$(DISPLAY=":$DISPLAY_NUM" xdpyinfo 2>/dev/null \
+    | awk '/dimensions:/ { print $2 }' || true)"
 
 note "Screen size: ${SCREEN_SIZE:-unknown}"
 
@@ -962,8 +1182,7 @@ AUDIO_SINKS_NOW="$(as_user pactl list short sinks 2>/dev/null || true)"
 if [[ "$AUDIO_SINKS_NOW" == *"$AUDIO_SINK"* ]]; then
     note "Audio test: PASSED ($AUDIO_SINK present)"
 else
-    note "Audio test: output '$AUDIO_SINK' still missing"
-    warn "Not fatal - this usually sorts itself out after a reboot."
+    warn "Audio output '$AUDIO_SINK' is still missing - not fatal, this usually sorts itself out after a reboot."
 fi
 
 
@@ -980,30 +1199,53 @@ fi
 
 step "[10/10] Launchers for second sessions"
 
+LAUNCHER_DIR="$USER_HOME/.local/share/applications"
+PROFILE_BASE="$USER_HOME/$PROFILE_DIR_NAME"
+
 if [[ "$CREATE_LAUNCHERS" != true ]]; then
 
     note "Skipped, as requested."
 
+# The launchers are a convenience, not the point of this setup, so a
+# problem with their directories only warns instead of throwing away
+# everything that was built before.
+elif ! make_user_dir "$LAUNCHER_DIR" || ! make_user_dir "$PROFILE_BASE"; then
+
+    warn "Could not create the launcher directories - launchers were skipped."
+
 else
-
-    LAUNCHER_DIR="$USER_HOME/.local/share/applications"
-    PROFILE_BASE="$USER_HOME/$PROFILE_DIR_NAME"
-
-    mkdir -p "$LAUNCHER_DIR" "$PROFILE_BASE"
 
     CREATED_LAUNCHERS=0
 
+    # Programs already given a launcher, by the real path behind the
+    # command name.
+    HANDLED_PROGRAMS=""
+
     # Creates a launcher if the application is present.
-    #   $1 command, $2 display name, $3 extra arguments, $4 icon
+    #   $1 command, $2 display name, $3 extra arguments, $4 icon,
+    #   $5 menu category
     create_launcher() {
         local program="$1"
         local display_name="$2"
         local arguments="$3"
         local icon="$4"
+        local category="$5"
 
         if ! command -v "$program" >/dev/null 2>&1; then
             return 0
         fi
+
+        # google-chrome and google-chrome-stable are the same binary,
+        # and so are chromium and chromium-browser. Without this the
+        # menu would show the same entry twice.
+        local target
+        target="$(readlink -f "$(command -v "$program")")"
+
+        if [[ " $HANDLED_PROGRAMS " == *" $target "* ]]; then
+            return 0
+        fi
+
+        HANDLED_PROGRAMS="$HANDLED_PROGRAMS $target"
 
         local path="$LAUNCHER_DIR/${program}-second-session.desktop"
 
@@ -1016,7 +1258,7 @@ Comment=Separate profile, runs next to an already open session
 Exec=$program $arguments
 Icon=$icon
 Terminal=false
-Categories=Network;
+Categories=$category;
 EOF
 
         chmod 0644 "$path"
@@ -1026,36 +1268,36 @@ EOF
 
     # Chrome and relatives: a separate data directory is enough.
     create_launcher google-chrome "Google Chrome" \
-        "--user-data-dir=$PROFILE_BASE/google-chrome" "google-chrome"
+        "--user-data-dir=$PROFILE_BASE/google-chrome" "google-chrome" "Network"
 
     create_launcher google-chrome-stable "Google Chrome" \
-        "--user-data-dir=$PROFILE_BASE/google-chrome" "google-chrome"
+        "--user-data-dir=$PROFILE_BASE/google-chrome" "google-chrome" "Network"
 
     create_launcher chromium "Chromium" \
-        "--user-data-dir=$PROFILE_BASE/chromium" "chromium"
+        "--user-data-dir=$PROFILE_BASE/chromium" "chromium" "Network"
 
     create_launcher chromium-browser "Chromium" \
-        "--user-data-dir=$PROFILE_BASE/chromium" "chromium-browser"
+        "--user-data-dir=$PROFILE_BASE/chromium" "chromium-browser" "Network"
 
     create_launcher microsoft-edge "Microsoft Edge" \
-        "--user-data-dir=$PROFILE_BASE/edge" "microsoft-edge"
+        "--user-data-dir=$PROFILE_BASE/edge" "microsoft-edge" "Network"
 
     create_launcher brave-browser "Brave" \
-        "--user-data-dir=$PROFILE_BASE/brave" "brave-browser"
+        "--user-data-dir=$PROFILE_BASE/brave" "brave-browser" "Network"
 
     create_launcher vivaldi-stable "Vivaldi" \
-        "--user-data-dir=$PROFILE_BASE/vivaldi" "vivaldi"
+        "--user-data-dir=$PROFILE_BASE/vivaldi" "vivaldi" "Network"
 
     create_launcher code "Visual Studio Code" \
-        "--user-data-dir=$PROFILE_BASE/vscode" "code"
+        "--user-data-dir=$PROFILE_BASE/vscode" "code" "Development"
 
     # Firefox and Thunderbird additionally need --no-remote, otherwise
     # they hand the call over despite the separate profile.
     create_launcher firefox "Firefox" \
-        "--no-remote --profile $PROFILE_BASE/firefox" "firefox"
+        "--no-remote --profile $PROFILE_BASE/firefox" "firefox" "Network"
 
     create_launcher thunderbird "Thunderbird" \
-        "--no-remote --profile $PROFILE_BASE/thunderbird" "thunderbird"
+        "--no-remote --profile $PROFILE_BASE/thunderbird" "thunderbird" "Network"
 
     chown -R "$USERNAME:$USER_GROUP" "$LAUNCHER_DIR" "$PROFILE_BASE"
 
@@ -1067,7 +1309,7 @@ EOF
     if (( CREATED_LAUNCHERS == 0 )); then
         note "None of the known applications found - nothing created."
     else
-        note "$CREATED_LAUNCHERS launchers are in the menu under 'Internet'."
+        note "$CREATED_LAUNCHERS launchers are in the menu (browsers under 'Internet')."
     fi
 
     echo
@@ -1085,7 +1327,13 @@ fi
 
 # ----------------------------------------------------------
 # RESULT
+#
+# The error trap is switched off from here on. Everything below
+# only reports; a failed check must not print the big "ABORTED"
+# box on top of the summary that has just explained the problem.
 # ----------------------------------------------------------
+
+trap - ERR
 
 echo
 echo "=================================================="
@@ -1106,6 +1354,21 @@ if [[ -n "$ALLOWED_IP" ]]; then
     echo " Allowed IP:  $ALLOWED_IP"
 else
     echo " Allowed IP:  any"
+fi
+
+if (( ${#WARNINGS[@]} > 0 )); then
+
+    echo
+    echo " --------------------------------------------------"
+    echo " ${#WARNINGS[@]} step(s) did not complete:"
+    echo
+
+    for WARNING in "${WARNINGS[@]}"; do
+        echo "   - $WARNING"
+    done
+
+    echo " --------------------------------------------------"
+
 fi
 
 echo
@@ -1142,7 +1405,20 @@ echo " 4. Open the PIN page of the web interface BEFORE"
 echo "    clicking connect in Moonlight. Otherwise the"
 echo "    attempts expire and block each other (error 409)."
 echo
+echo " GOOD TO KNOW"
+echo
+echo " - The screen is fixed at $RESOLUTION. A client with a"
+echo "   different shape gets black bars; the resolution"
+echo "   cannot be switched while running."
+echo " - Gamepads need the kernel module 'uhid', which many"
+echo "   virtual servers do not offer. Keyboard and mouse"
+echo "   work regardless."
+echo
 echo " USEFUL COMMANDS"
+echo "   $(basename "$RESET_COMMAND")"
+echo "     Restarts this setup only. RDP is not touched."
+echo "     (xrdp-session-reset does the opposite.)"
+echo
 echo "   systemctl status sunshine-stream"
 echo "   systemctl restart sunshine-stream"
 echo "   journalctl -u sunshine-stream -n 50 --no-pager"
@@ -1156,6 +1432,7 @@ echo
 echo " REMOVING EVERYTHING AGAIN"
 echo "   systemctl disable --now sunshine-stream sunshine-desktop sunshine-xorg"
 echo "   rm -f $SERVICE_DIR/sunshine-{xorg,desktop,stream}.service"
+echo "   rm -f $RESET_COMMAND"
 echo "   systemctl daemon-reload"
 echo "   apt-get remove -y sunshine"
 echo
@@ -1164,4 +1441,11 @@ echo
 echo " Backups from this run: $BACKUP_DIR/*.$TIMESTAMP"
 echo "=================================================="
 
-[[ "$ALL_GOOD" == true ]]
+# A failed check has to show in the exit code, for anyone calling this
+# script from another one. "exit" rather than a bare test, so no error
+# trap can fire on the way out.
+if [[ "$ALL_GOOD" != true ]]; then
+    exit 1
+fi
+
+exit 0
