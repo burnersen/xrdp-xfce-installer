@@ -15,11 +15,12 @@ set -Eeuo pipefail
 #   - UFW firewall, enabled BEFORE XRDP is installed
 #   - fail2ban for SSH and XRDP, verified after installation
 #   - Optional fast DNS resolvers, with automatic rollback
+#   - Optional: install updates only at boot, never while working
 #   - Google Chrome and Firefox (Firefox from Mozilla APT, not Snap)
 #   - Optional: JDownloader 2 (desktop app or headless service)
 # ==========================================================
 
-readonly INSTALLER_VERSION="2.0.0"
+readonly INSTALLER_VERSION="2.1.0"
 
 readonly DNS_PRIMARY="1.1.1.1"
 readonly DNS_SECONDARY="8.8.8.8"
@@ -33,6 +34,10 @@ readonly DEFAULT_RDP_PORT=3389
 readonly SESMAN_LOG="/var/log/xrdp-sesman.log"
 readonly XRDP_FILTER="/etc/fail2ban/filter.d/xrdp-sesman.conf"
 readonly JD_DIR="/opt/jdownloader"
+
+readonly BOOT_UPDATE_SCRIPT="/usr/local/bin/xrdp-boot-update"
+readonly BOOT_UPDATE_SERVICE="/etc/systemd/system/xrdp-boot-update.service"
+readonly BOOT_UPDATE_LOG="/var/log/xrdp-boot-update.log"
 
 # A downloaded JDownloader.jar is always larger than this.
 # Anything smaller is an error page, not a program.
@@ -721,6 +726,44 @@ fi
 
 
 # ----------------------------------------------------------
+# UPDATE POLICY
+#
+# The default Ubuntu behaviour installs security updates in the
+# background, whenever its timer fires. On a machine that is
+# being worked on, a service restarted at the wrong moment can
+# tear down a running desktop session.
+#
+# The alternative offered here moves the work to boot time,
+# which is the one moment when nothing is running yet.
+# ----------------------------------------------------------
+
+echo
+
+read -rp \
+    "Install system updates at boot instead of during work? [y/N]: " \
+    BOOT_UPDATES < /dev/tty
+
+BOOT_UPDATES="${BOOT_UPDATES:-N}"
+
+if [[ "$BOOT_UPDATES" =~ ^[Yy]$ ]]; then
+
+    BOOT_UPDATES=true
+
+    echo "NOTE: Updates are installed while the server boots."
+    echo "      RDP waits for them; SSH stays available throughout."
+    echo "      Security updates keep arriving in the background,"
+    echo "      but no service is restarted while you are working."
+
+else
+
+    BOOT_UPDATES=false
+
+    echo "NOTE: Keeping the standard Ubuntu update behaviour."
+
+fi
+
+
+# ----------------------------------------------------------
 # PASSWORD
 # ----------------------------------------------------------
 
@@ -768,7 +811,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[1/13] Configuring DNS resolvers"
+echo "[1/14] Configuring DNS resolvers"
 
 CLOUD_INIT_FILE="/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
 CLOUD_INIT_FILE_CREATED=false
@@ -1028,7 +1071,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[2/13] Updating system"
+echo "[2/14] Updating system"
 
 apt-get update
 
@@ -1047,7 +1090,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[3/13] Configuring UFW"
+echo "[3/14] Configuring UFW"
 
 if ! command -v ufw >/dev/null 2>&1; then
 
@@ -1181,7 +1224,7 @@ ufw --force enable
 # ----------------------------------------------------------
 
 echo
-echo "[4/13] Installing XFCE, XRDP and dependencies"
+echo "[4/14] Installing XFCE, XRDP and dependencies"
 
 # sudo is not in this list on purpose. Ubuntu 26.04 ships
 # sudo-rs as the default provider; installing the package
@@ -1288,7 +1331,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[5/13] Configuring XRDP"
+echo "[5/14] Configuring XRDP"
 
 if getent group ssl-cert >/dev/null 2>&1; then
 
@@ -1340,7 +1383,7 @@ set_ini_key "$XRDP_INI" "Globals" "max_bpp" "24" || true
 # ----------------------------------------------------------
 
 echo
-echo "[6/13] Configuring persistent sessions"
+echo "[6/14] Configuring persistent sessions"
 
 set_ini_key "$SESMAN_INI" "Sessions" "Policy" "Default" || true
 set_ini_key "$SESMAN_INI" "Sessions" "KillDisconnected" "false" || true
@@ -1363,7 +1406,7 @@ systemctl restart xrdp
 # ----------------------------------------------------------
 
 echo
-echo "[7/13] Configuring user '$USERNAME'"
+echo "[7/14] Configuring user '$USERNAME'"
 
 if [[ "$USER_EXISTS" == false ]]; then
 
@@ -1414,7 +1457,7 @@ USER_GROUP="$(id -gn "$USERNAME")"
 # ----------------------------------------------------------
 
 echo
-echo "[8/13] Configuring XFCE session"
+echo "[8/14] Configuring XFCE session"
 
 cat > "$HOME_DIR/.xsession" <<'EOF'
 exec startxfce4
@@ -1434,7 +1477,7 @@ chmod 0644 "$HOME_DIR/.xsession"
 # ----------------------------------------------------------
 
 echo
-echo "[9/13] Configuring polkit for XRDP"
+echo "[9/14] Configuring polkit for XRDP"
 
 if command -v pkaction >/dev/null 2>&1; then
 
@@ -1533,7 +1576,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[10/13] Configuring fail2ban"
+echo "[10/14] Configuring fail2ban"
 
 cat > "$XRDP_FILTER" <<'EOF'
 # Matches the AUTHFAIL line written by xrdp-sesman, e.g.
@@ -1688,7 +1731,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[11/13] Installing browsers"
+echo "[11/14] Installing browsers"
 
 
 # ----------------------------------------------------------
@@ -1817,7 +1860,7 @@ rm -f "$MOZILLA_KEY_TEMP"
 # ----------------------------------------------------------
 
 echo
-echo "[12/13] Installing optional components"
+echo "[12/14] Installing optional components"
 
 if [[ "$JD_MODE" != "none" ]]; then
 
@@ -1994,11 +2037,198 @@ chmod 0755 /usr/local/bin/xrdp-session-reset
 
 
 # ----------------------------------------------------------
+# UPDATE POLICY
+#
+# Moves the update work to boot time, the one moment when no
+# session is running and a service restart costs nothing.
+#
+# Three parts:
+#   - a service that updates the system while it boots
+#   - needrestart only lists services during normal operation
+#   - unattended-upgrades leaves XRDP alone
+# ----------------------------------------------------------
+
+echo
+echo "[13/14] Configuring update policy"
+
+if [[ "$BOOT_UPDATES" == false ]]; then
+
+    echo "Keeping the standard Ubuntu update behaviour."
+
+else
+
+    cat > "$BOOT_UPDATE_SCRIPT" <<'BOOT_UPDATE_EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Installs pending updates once, while the system boots.
+#
+# Started by xrdp-boot-update.service, which XRDP waits for.
+# SSH deliberately does not wait: if this ever hangs, the server
+# still has to be reachable.
+#
+# Nothing is ever rebooted here. The reboot is always the user's.
+
+readonly LOG_FILE="/var/log/xrdp-boot-update.log"
+readonly MAX_LOG_BYTES=1048576
+readonly DNS_WAIT_SECONDS=90
+readonly DNS_PROBE_HOST="archive.ubuntu.com"
+
+# At boot nothing is in use yet, so this is the right moment to
+# let services restart. While the system is running, needrestart
+# is configured to only list them.
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+
+log() {
+    printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+}
+
+# Keep the log from growing without bound.
+if [[ -f "$LOG_FILE" ]] &&
+   (( $(stat -c '%s' "$LOG_FILE" 2>/dev/null || echo 0) > MAX_LOG_BYTES )); then
+    mv -f "$LOG_FILE" "${LOG_FILE}.old"
+fi
+
+log "===== boot update started ====="
+
+# network-online.target can be reached before name resolution
+# actually answers.
+waited=0
+
+while ! getent hosts "$DNS_PROBE_HOST" >/dev/null 2>&1; do
+
+    if (( waited >= DNS_WAIT_SECONDS )); then
+        log "no name resolution after ${DNS_WAIT_SECONDS}s - nothing was updated"
+        exit 0
+    fi
+
+    sleep 5
+    waited=$(( waited + 5 ))
+
+done
+
+if ! apt-get update >> "$LOG_FILE" 2>&1; then
+    log "apt-get update failed - nothing was updated"
+    exit 0
+fi
+
+# "upgrade", not "full-upgrade": this never removes a package.
+#
+# Retries and timeouts keep a slow mirror from holding the
+# desktop back for the full service timeout.
+if apt-get -y \
+        -o Acquire::Retries=3 \
+        -o Acquire::http::Timeout=30 \
+        -o Acquire::https::Timeout=30 \
+        upgrade >> "$LOG_FILE" 2>&1; then
+
+    log "upgrade finished"
+
+else
+
+    log "upgrade FAILED - see the apt output above"
+
+fi
+
+# A new kernel only takes effect on the NEXT boot.
+if [[ -f /var/run/reboot-required ]]; then
+    log "a new kernel was installed - it becomes active on the next reboot"
+fi
+
+log "===== boot update finished ====="
+BOOT_UPDATE_EOF
+
+    chmod 0755 "$BOOT_UPDATE_SCRIPT"
+
+    cat > "$BOOT_UPDATE_SERVICE" <<EOF
+[Unit]
+Description=Install pending system updates at boot
+After=network-online.target
+Wants=network-online.target
+
+# XRDP waits for the update to finish, so an upgrade can never
+# pull the desktop out from under a session.
+#
+# SSH is deliberately NOT listed here: if an update ever hangs,
+# the machine has to stay reachable.
+Before=xrdp.service xrdp-sesman.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$BOOT_UPDATE_SCRIPT
+
+# An update that hangs must not block the desktop forever.
+# Generous on purpose: aborting dpkg halfway is worse than waiting.
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    chmod 0644 "$BOOT_UPDATE_SERVICE"
+
+    # needrestart asks which services to restart after an upgrade,
+    # and restarts them. While somebody is working, that is exactly
+    # what must not happen.
+    if [[ -d /etc/needrestart ]]; then
+
+        mkdir -p /etc/needrestart/conf.d
+
+        cat > /etc/needrestart/conf.d/99-xrdp-installer.conf <<'EOF'
+# Installed by the XRDP + XFCE installer.
+#
+# Only LIST outdated services while the system is running - a
+# restart at the wrong moment tears down a live desktop session.
+# xrdp-boot-update restarts them at boot instead.
+
+$nrconf{restart} = 'l';
+EOF
+
+        chmod 0644 /etc/needrestart/conf.d/99-xrdp-installer.conf
+
+    fi
+
+    # Security updates keep arriving in the background, but XRDP
+    # itself is left alone: upgrading it restarts the service and
+    # disconnects a running desktop.
+    cat > /etc/apt/apt.conf.d/52-xrdp-unattended-upgrades <<'EOF'
+// Installed by the XRDP + XFCE installer.
+//
+// Security updates keep being installed in the background, but
+// XRDP is excluded: upgrading it restarts the service and would
+// disconnect a running desktop. It is upgraded at boot instead.
+
+Unattended-Upgrade::Package-Blacklist {
+    "xrdp";
+    "xorgxrdp";
+};
+
+// Never reboot on its own. The reboot is always the user's.
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
+
+    chmod 0644 /etc/apt/apt.conf.d/52-xrdp-unattended-upgrades
+
+    systemctl daemon-reload
+
+    if systemctl enable xrdp-boot-update.service >/dev/null 2>&1; then
+        echo "Updates will be installed at boot, before RDP becomes available."
+        echo "Log: $BOOT_UPDATE_LOG"
+    else
+        warn "The boot update service could not be enabled."
+    fi
+
+fi
+
+
+# ----------------------------------------------------------
 # VERIFY
 # ----------------------------------------------------------
 
 echo
-echo "[13/13] Verifying installation"
+echo "[14/14] Verifying installation"
 
 INSTALL_OK=true
 
@@ -2057,6 +2287,18 @@ else
 
     echo "fail2ban:     WARNING (not running)"
     warn "fail2ban is not running."
+
+fi
+
+
+if [[ "$BOOT_UPDATES" == true ]]; then
+
+    if systemctl is-enabled --quiet xrdp-boot-update.service 2>/dev/null; then
+        echo "Boot updates: enabled"
+    else
+        echo "Boot updates: NOT ENABLED"
+        warn "The boot update service is not enabled - updates will not run at boot."
+    fi
 
 fi
 
@@ -2140,6 +2382,28 @@ echo "   fail2ban-client status sshd"
 echo "   fail2ban-client status xrdp"
 echo "   fail2ban-client set xrdp unbanip <IP>"
 echo "   xrdp-session-reset"
+
+if [[ "$BOOT_UPDATES" == true ]]; then
+
+    echo
+    echo " Updates"
+    echo
+    echo " The system updates itself while it boots, before RDP"
+    echo " becomes available. Nothing is upgraded or restarted while"
+    echo " you are working. SSH is reachable during the update."
+    echo
+    echo " What happened last time:"
+    echo "   tail -n 20 $BOOT_UPDATE_LOG"
+    echo
+    echo " Update now, without rebooting:"
+    echo "   $BOOT_UPDATE_SCRIPT"
+    echo
+    echo " Security updates still arrive in the background, but no"
+    echo " service is restarted and XRDP itself is left alone."
+    echo
+    echo " A new kernel only takes effect after the NEXT reboot."
+
+fi
 
 if [[ "$JD_MODE" == "service" ]]; then
 

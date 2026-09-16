@@ -30,6 +30,7 @@ Two optional companion scripts complete the setup: `german.sh` for a German syst
 **Extras**
 
 - Optional fast DNS resolvers, replacing name servers that make every page load slowly
+- Optional update policy that moves all upgrades to boot time, so nothing is ever restarted under a running session
 - Google Chrome on amd64, Chromium elsewhere
 - Firefox from Mozilla's APT repository instead of the Snap build
 - FUSE 2, so AppImage applications start without further setup
@@ -75,6 +76,7 @@ The installer asks for:
 - the allowed IPv4 address, if restricted
 - whether JDownloader should be installed, and in which mode
 - whether the name servers should be replaced
+- whether updates should be installed at boot instead of during work
 - the password for the RDP user
 
 All questions come first, and nothing is installed or changed until the last one is answered. `Ctrl+C` **during the questions** therefore leaves the system untouched. Once the installation itself is running that no longer holds: interrupting it halfway leaves packages half configured, so let it finish.
@@ -204,6 +206,38 @@ Two details make the difference between real protection and the appearance of it
 The XRDP filter is verified during the installation: it is run against sample `AUTHFAIL` lines, and against the real log if it already holds any. A filter that matches nothing is reported as a warning rather than left to look fine.
 
 If RDP is publicly accessible, use a long randomly generated password. fail2ban limits brute force attempts, but it is not a substitute for a strong password.
+
+---
+
+## Updates
+
+Optional, and off by default. Ubuntu normally installs security updates in the background, whenever its timer fires. On a machine that is actually being worked on, that is the wrong moment: a service restarted while a desktop session is open can tear the session down.
+
+Answering `y` moves the work to boot time, which is the one moment when nothing is running yet.
+
+**While the system is running**
+
+- Security updates keep being downloaded and installed, so the machine does not fall behind.
+- No service is restarted. `needrestart` only lists what is outdated instead of acting on it.
+- XRDP itself is excluded from background upgrades entirely, because upgrading it restarts the service.
+- Nothing ever reboots on its own. The reboot is always yours.
+
+**While the system boots**
+
+- `apt upgrade` runs once, before RDP becomes available, and services are restarted normally.
+- **SSH does not wait for it.** If an update ever hangs, the machine has to stay reachable - that is the whole point of not letting RDP be the only way in.
+- `upgrade`, not `full-upgrade`: nothing is ever removed.
+- The service gives up after 30 minutes, and it gives up after 90 seconds if name resolution is not working yet.
+
+```bash
+tail -n 20 /var/log/xrdp-boot-update.log   # what happened last time
+xrdp-boot-update                           # update now, without rebooting
+```
+
+Two things worth knowing before choosing this:
+
+- A new kernel installed at boot only becomes active on the **next** reboot. That is unavoidable if nothing may reboot on its own.
+- Between two reboots the machine gets security updates but no restarts, so a fix in a running service only takes effect once you restart. On a server that stays up for months with a public RDP port, reboot occasionally.
 
 ---
 
