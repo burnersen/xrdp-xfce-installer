@@ -5,23 +5,59 @@ set -Eeuo pipefail
 # XRDP + XFCE Remote Desktop Installer
 #
 # Ubuntu 20.04+
+# Verified against Ubuntu 24.04 LTS (xrdp 0.9.24)
+#                  Ubuntu 26.04 LTS (xrdp 0.10.1)
 #
 # Features:
 #   - XFCE desktop reachable over RDP
 #   - Persistent sessions (reconnect from any device/IP)
-#   - Custom RDP port
-#   - UFW firewall (SSH access is preserved)
-#   - RDP restricted to an IPv4/IPv6 address or CIDR range,
-#     or open after an explicit confirmation
-#   - fail2ban for SSH and XRDP
-#   - Fast DNS resolvers (the provider name servers are replaced)
-#   - Swap file, sized from the installed memory
-#   - Automatic security updates, without automatic reboots
-#   - FUSE 2, so AppImage applications start out of the box
+#   - Custom RDP port, checked against ports already in use
+#   - UFW firewall, enabled BEFORE XRDP is installed
+#   - fail2ban for SSH and XRDP, verified after installation
+#   - Optional fast DNS resolvers, with automatic rollback
 #   - Google Chrome and Firefox (Firefox from Mozilla APT, not Snap)
-#   - xrdp-session-reset helper for a stuck session
 #   - Optional: JDownloader 2 (desktop app or headless service)
 # ==========================================================
+
+readonly INSTALLER_VERSION="2.0.0"
+
+readonly DNS_PRIMARY="1.1.1.1"
+readonly DNS_SECONDARY="8.8.8.8"
+
+readonly MIN_PASSWORD_LENGTH_RESTRICTED=8
+readonly MIN_PASSWORD_LENGTH_PUBLIC=12
+
+readonly MIN_UNPRIVILEGED_PORT=1024
+readonly DEFAULT_RDP_PORT=3389
+
+readonly SESMAN_LOG="/var/log/xrdp-sesman.log"
+readonly XRDP_FILTER="/etc/fail2ban/filter.d/xrdp-sesman.conf"
+readonly JD_DIR="/opt/jdownloader"
+
+# A downloaded JDownloader.jar is always larger than this.
+# Anything smaller is an error page, not a program.
+readonly MIN_JAR_SIZE_BYTES=100000
+
+# Ubuntu releases this installer has actually been tried on.
+readonly FIRST_VERIFIED_UBUNTU="24.04"
+
+
+# ----------------------------------------------------------
+# WARNINGS
+#
+# Only the desktop itself, the user account and the firewall
+# are treated as fatal. Everything else records a warning and
+# the installation continues, so a temporary problem with one
+# download cannot leave a half configured server behind.
+# ----------------------------------------------------------
+
+declare -a WARNINGS=()
+
+warn() {
+    echo "WARNING: $*" >&2
+    WARNINGS+=("$*")
+}
+
 
 on_error() {
     local exit_code=$?
@@ -62,7 +98,7 @@ fi
 
 
 echo "=================================================="
-echo " XRDP + XFCE Remote Desktop Installer"
+echo " XRDP + XFCE Remote Desktop Installer $INSTALLER_VERSION"
 echo " Ubuntu 20.04+"
 echo "=================================================="
 echo
@@ -104,6 +140,27 @@ echo "  OS:   ${PRETTY_NAME:-Ubuntu}"
 echo "  Arch: $ARCH"
 echo
 
+if ! dpkg --compare-versions "$UBUNTU_VERSION" ge "$FIRST_VERIFIED_UBUNTU"; then
+    echo "NOTE: This installer is verified on Ubuntu $FIRST_VERIFIED_UBUNTU and newer."
+    echo "      It should work on $UBUNTU_VERSION, but has not been tested there."
+    echo
+fi
+
+
+# ----------------------------------------------------------
+# NON INTERACTIVE PACKAGE HANDLING
+#
+# needrestart (Ubuntu 22.04 and newer) asks which services to
+# restart after an upgrade. That dialog ignores
+# DEBIAN_FRONTEND and makes the installation look frozen.
+# NEEDRESTART_MODE=a restarts the affected services without
+# asking. Restarting sshd does not drop an existing SSH
+# connection, so this is safe here.
+# ----------------------------------------------------------
+
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+
 
 # ----------------------------------------------------------
 # HELPERS
@@ -134,89 +191,232 @@ is_valid_ipv4() {
 }
 
 
-# Validate an IPv4 or IPv6 address, or a CIDR range.
-#
-# Prints the normalised value on success, returns 1 on
-# failure. A CIDR range matters for IPv6: many consumer
-# lines keep a stable prefix while the suffix changes, so
-# allowing 2001:db8:1234:5678::/64 keeps working where a
-# single address would not.
-#
-# Parsing is done with Python's ipaddress module, which
-# handles every IPv6 notation correctly. Writing that in
-# Bash reliably is not realistic. Without Python the
-# script falls back to IPv4 only.
+# Prints the "ss" line of whatever listens on the given TCP
+# port, or nothing at all if the port is free.
 
-normalise_ip() {
+listener_on_port() {
+    local port="$1"
 
-    local value="$1"
-
-    if command -v python3 >/dev/null 2>&1; then
-
-        python3 - "$value" <<'PYTHON'
-import ipaddress
-import sys
-
-value = sys.argv[1].strip()
-
-try:
-    if "/" in value:
-        print(ipaddress.ip_network(value, strict=False).with_prefixlen)
-    else:
-        print(ipaddress.ip_address(value))
-except ValueError:
-    sys.exit(1)
-PYTHON
-
-        return $?
-
-    fi
-
-    if is_valid_ipv4 "$value"; then
-        printf '%s\n' "$value"
-        return 0
-    fi
-
-    return 1
+    LC_ALL=C ss -tlnp 2>/dev/null | awk -v wanted="$port" '
+        NR > 1 {
+            address = $4
+            sub(/.*:/, "", address)
+            if (address == wanted) {
+                print
+            }
+        }'
 }
 
 
-# Set a key in an INI style file.
+# Set a key in an INI style file, inside a named section.
 #
-# Replaces the FIRST active key, uncomments the first
-# commented key, or appends the key if it is missing.
+# Replaces the first active key of that section, uncomments a
+# commented one, or inserts the key at the end of the section
+# if it is missing.
 #
-# Only the first occurrence is touched on purpose.
-# xrdp.ini contains several "port=" lines: the listening
-# port in [Globals], plus per-module values such as
-# "port=-1" and "port=ask3389". Replacing all of them
-# breaks the session backend.
+# The section matters. xrdp.ini contains several "port=" lines:
+# the listening port in [Globals], plus per module values such
+# as "port=-1" in [Xvnc] and "port=ask3389" in [neutrinordp-any].
+# Appending a missing key to the END of the file would place it
+# in whatever section happens to come last, where it has no
+# effect at all.
 
 set_ini_key() {
 
     local file="$1"
-    local key="$2"
-    local value="$3"
+    local section="$2"
+    local key="$3"
+    local value="$4"
+    local temp_file
 
     if [[ ! -f "$file" ]]; then
-        echo "WARNING: $file not found, skipping $key."
+        warn "$file not found - skipping $key."
+        return 1
+    fi
+
+    if ! temp_file="$(mktemp)"; then
+        warn "Could not create a temporary file for $file."
+        return 1
+    fi
+
+    # The file is read twice: the first pass decides what has to
+    # happen, the second pass writes the result.
+    if ! awk -v section="$section" -v key="$key" -v value="$value" '
+
+        BEGIN {
+            active_pattern    = "^[ \t]*" key "[ \t]*="
+            commented_pattern = "^[ \t]*[#;][ \t]*" key "[ \t]*="
+        }
+
+        FNR == NR {
+
+            if ($0 ~ /^[ \t]*\[/) {
+
+                name = $0
+                sub(/^[ \t]*\[[ \t]*/, "", name)
+                sub(/[ \t]*\].*$/, "", name)
+
+                if (tolower(name) == tolower(section) && !section_found) {
+                    in_section    = 1
+                    section_found = 1
+                    section_end   = FNR
+                } else {
+                    in_section = 0
+                }
+
+                next
+            }
+
+            if (in_section) {
+
+                if ($0 !~ /^[ \t]*$/) {
+                    section_end = FNR
+                }
+
+                if (!active_line && $0 ~ active_pattern) {
+                    active_line = FNR
+                }
+
+                if (!commented_line && $0 ~ commented_pattern) {
+                    commented_line = FNR
+                }
+            }
+
+            next
+        }
+
+        !initialised {
+            target      = active_line ? active_line : commented_line
+            initialised = 1
+        }
+
+        FNR == target {
+            print key "=" value
+            next
+        }
+
+        { print }
+
+        FNR == section_end && !target && section_found {
+            print key "=" value
+        }
+
+        END {
+            if (!section_found) {
+                print ""
+                print "[" section "]"
+                print key "=" value
+            }
+        }
+
+    ' "$file" "$file" > "$temp_file"; then
+
+        rm -f "$temp_file"
+        warn "Could not prepare the update of $key in $file."
+        return 1
+    fi
+
+    # "cat >" keeps owner and permissions of the original file.
+    if ! cat "$temp_file" > "$file"; then
+        rm -f "$temp_file"
+        warn "Could not write $file."
+        return 1
+    fi
+
+    rm -f "$temp_file"
+    return 0
+}
+
+
+# ----------------------------------------------------------
+# SSH PORTS
+#
+# Collected BEFORE the questions, for two reasons: the chosen
+# RDP port must not collide with SSH, and the firewall is
+# enabled early, so the SSH ports have to be known by then.
+# ----------------------------------------------------------
+
+declare -a SSH_PORTS=()
+
+
+add_ssh_port() {
+
+    local port="$1"
+    local existing
+
+    [[ "$port" =~ ^[0-9]+$ ]] || return 0
+
+    if (( port < 1 || port > 65535 )); then
         return 0
     fi
 
-    if grep -qE "^[[:space:]]*${key}=" "$file"; then
+    for existing in "${SSH_PORTS[@]}"; do
 
-        sed -i -E "0,/^[[:space:]]*${key}=.*/s||${key}=${value}|" "$file"
+        if [[ "$existing" == "$port" ]]; then
+            return 0
+        fi
 
-    elif grep -qE "^[[:space:]]*[;#][[:space:]]*${key}=" "$file"; then
+    done
 
-        sed -i -E "0,/^[[:space:]]*[;#][[:space:]]*${key}=.*/s||${key}=${value}|" "$file"
-
-    else
-
-        printf '%s=%s\n' "$key" "$value" >> "$file"
-
-    fi
+    SSH_PORTS+=("$port")
 }
+
+
+# The port of the connection this script is running in.
+
+if [[ -n "${SSH_CONNECTION:-}" ]]; then
+
+    read -r _ _ _ SSH_CURRENT_PORT <<< "$SSH_CONNECTION"
+
+    add_ssh_port "$SSH_CURRENT_PORT"
+
+fi
+
+# The effective sshd configuration.
+
+if command -v sshd >/dev/null 2>&1; then
+
+    SSHD_CONFIG="$(sshd -T 2>/dev/null || true)"
+
+    while read -r KEY VALUE _; do
+
+        if [[ "$KEY" == "port" ]]; then
+            add_ssh_port "$VALUE"
+        fi
+
+    done <<< "$SSHD_CONFIG"
+
+fi
+
+# What sshd is actually listening on. This is the safety net:
+# "sshd -T" fails on some configurations, and locking the
+# running SSH connection out would leave the server
+# unreachable.
+
+if command -v ss >/dev/null 2>&1; then
+
+    SSHD_LISTEN_PORTS="$(
+        LC_ALL=C ss -tlnp 2>/dev/null | awk '
+            NR > 1 && /"sshd"/ {
+                address = $4
+                sub(/.*:/, "", address)
+                print address
+            }' | sort -u
+    )"
+
+    while read -r LISTEN_PORT; do
+
+        if [[ -n "$LISTEN_PORT" ]]; then
+            add_ssh_port "$LISTEN_PORT"
+        fi
+
+    done <<< "$SSHD_LISTEN_PORTS"
+
+fi
+
+if (( ${#SSH_PORTS[@]} == 0 )); then
+    add_ssh_port 22
+fi
 
 
 # ----------------------------------------------------------
@@ -283,40 +483,95 @@ fi
 #
 # The default port 3389 is scanned constantly by bots.
 # A non standard port removes most of that noise.
+#
+# The port is asked in a loop: a port that is already taken is
+# a typo, not a reason to start the whole installation again.
 # ----------------------------------------------------------
 
 echo
 
-read -rp \
-    "RDP port [3389]: " \
-    RDP_PORT < /dev/tty
+while true; do
 
-RDP_PORT="${RDP_PORT:-3389}"
+    read -rp \
+        "RDP port [$DEFAULT_RDP_PORT]: " \
+        RDP_PORT < /dev/tty
 
-if ! [[ "$RDP_PORT" =~ ^[0-9]+$ ]] ||
-   (( RDP_PORT < 1 || RDP_PORT > 65535 )); then
+    RDP_PORT="${RDP_PORT:-$DEFAULT_RDP_PORT}"
 
-    echo "ERROR: Invalid port number." >&2
-    exit 1
-fi
+    if ! [[ "$RDP_PORT" =~ ^[0-9]+$ ]] ||
+       (( RDP_PORT < 1 || RDP_PORT > 65535 )); then
 
-if (( RDP_PORT < 1024 )) && (( RDP_PORT != 3389 )); then
-    echo "ERROR: Ports below 1024 are reserved for system services." >&2
-    exit 1
-fi
-
-# Ports that would collide with other common services.
-
-for RESERVED in 22 80 443 3350 5900 9666; do
-
-    if (( RDP_PORT == RESERVED )); then
-        echo "ERROR: Port $RDP_PORT is used by another service." >&2
-        exit 1
+        echo "ERROR: Invalid port number."
+        continue
     fi
+
+    if (( RDP_PORT < MIN_UNPRIVILEGED_PORT )) &&
+       (( RDP_PORT != DEFAULT_RDP_PORT )); then
+
+        echo "ERROR: Ports below $MIN_UNPRIVILEGED_PORT are reserved for system services."
+        continue
+    fi
+
+    # Ports that would collide with other common services.
+
+    PORT_REJECTED=false
+
+    for RESERVED in 80 443 3350 5900 9666; do
+
+        if (( RDP_PORT == RESERVED )); then
+            echo "ERROR: Port $RDP_PORT is used by another common service."
+            PORT_REJECTED=true
+        fi
+
+    done
+
+    # SSH is the way back in if RDP ever breaks. Taking its
+    # port would cost both at once.
+
+    for SSH_PORT in "${SSH_PORTS[@]}"; do
+
+        if (( RDP_PORT == SSH_PORT )); then
+            echo "ERROR: Port $RDP_PORT is the SSH port of this server."
+            PORT_REJECTED=true
+        fi
+
+    done
+
+    if [[ "$PORT_REJECTED" == true ]]; then
+        continue
+    fi
+
+    # Anything else that is already listening. A port in use
+    # would let the XRDP service fail to start much later, with
+    # an error message that says nothing about the real cause.
+
+    if command -v ss >/dev/null 2>&1; then
+
+        PORT_LISTENER="$(listener_on_port "$RDP_PORT")"
+
+        if [[ -n "$PORT_LISTENER" ]]; then
+
+            if [[ "$PORT_LISTENER" == *xrdp* ]]; then
+
+                echo "NOTE: XRDP already listens on port $RDP_PORT."
+
+            else
+
+                echo "ERROR: Port $RDP_PORT is already in use:"
+                echo "  $PORT_LISTENER"
+                continue
+
+            fi
+
+        fi
+
+    fi
+
+    break
 
 done
 
-if (( RDP_PORT == 3389 )); then
+if (( RDP_PORT == DEFAULT_RDP_PORT )); then
     echo "NOTE: Using the default RDP port. Expect automated scans."
 else
     echo "NOTE: Clients must connect using <SERVER_IP>:$RDP_PORT"
@@ -330,51 +585,29 @@ fi
 echo
 
 read -rp \
-    "Restrict RDP access to one address or range? [Y/n]: " \
+    "Restrict RDP access to one IPv4 address? [Y/n]: " \
     LIMIT_RDP < /dev/tty
 
 LIMIT_RDP="${LIMIT_RDP:-Y}"
 
 if [[ "$LIMIT_RDP" =~ ^[Yy]$ ]]; then
 
-    echo
-    echo "IPv4 and IPv6 are both accepted, as a single"
-    echo "address or as a CIDR range."
-    echo
-    echo "  203.0.113.10"
-    echo "  2001:db8:1234:5678::1"
-    echo "  2001:db8:1234:5678::/64"
-    echo
-    echo "A range is useful on connections where only the"
-    echo "suffix changes but the prefix stays the same."
-    echo
-
     while true; do
 
         read -rp \
-            "Enter allowed address or range: " \
-            ALLOWED_IP_RAW < /dev/tty
+            "Enter allowed public IPv4 address: " \
+            ALLOWED_IP < /dev/tty
 
-        if ALLOWED_IP="$(normalise_ip "$ALLOWED_IP_RAW")"; then
+        if is_valid_ipv4 "$ALLOWED_IP"; then
             break
         fi
 
-        echo "ERROR: Not a valid address or range."
+        echo "ERROR: Invalid IPv4 address."
+        echo "Example: 203.0.113.10"
 
     done
 
-    # Everything not covered by the rule below stays denied,
-    # including the other address family. Restricting to an
-    # IPv4 address therefore blocks IPv6 access entirely,
-    # and the other way round.
-
-    if [[ "$ALLOWED_IP" == *:* ]]; then
-        echo "NOTE: This is an IPv6 rule. IPv4 clients will be blocked."
-    else
-        echo "NOTE: This is an IPv4 rule. IPv6 clients will be blocked."
-    fi
-
-    MIN_PASSWORD_LENGTH=8
+    MIN_PASSWORD_LENGTH="$MIN_PASSWORD_LENGTH_RESTRICTED"
 
 elif [[ "$LIMIT_RDP" =~ ^[Nn]$ ]]; then
 
@@ -394,7 +627,7 @@ elif [[ "$LIMIT_RDP" =~ ^[Nn]$ ]]; then
     fi
 
     ALLOWED_IP=""
-    MIN_PASSWORD_LENGTH=12
+    MIN_PASSWORD_LENGTH="$MIN_PASSWORD_LENGTH_PUBLIC"
 
 else
 
@@ -452,6 +685,42 @@ fi
 
 
 # ----------------------------------------------------------
+# DNS RESOLVERS
+#
+# Some hosting providers ship name servers that throttle
+# bursts of queries. A browser resolves 20-50 names while
+# building a single page, so the throttling shows up as pages
+# that load slowly or time out - while a single lookup on the
+# command line still looks perfectly healthy.
+#
+# Not every network wants this, so it is a question.
+# ----------------------------------------------------------
+
+echo
+
+read -rp \
+    "Replace the name servers with $DNS_PRIMARY and $DNS_SECONDARY? [Y/n]: " \
+    CHANGE_DNS < /dev/tty
+
+CHANGE_DNS="${CHANGE_DNS:-Y}"
+
+if [[ "$CHANGE_DNS" =~ ^[Yy]$ ]]; then
+
+    CHANGE_DNS=true
+
+    echo "NOTE: The current name servers are backed up and restored"
+    echo "      automatically if name resolution stops working."
+
+else
+
+    CHANGE_DNS=false
+
+    echo "NOTE: Keeping the name servers of this network."
+
+fi
+
+
+# ----------------------------------------------------------
 # PASSWORD
 # ----------------------------------------------------------
 
@@ -483,14 +752,13 @@ if (( ${#USER_PASSWORD} < MIN_PASSWORD_LENGTH )); then
 fi
 
 
+# ==========================================================
+# From here on the system is modified.
+# ==========================================================
+
+
 # ----------------------------------------------------------
 # DNS RESOLVERS
-#
-# Some hosting providers ship name servers that throttle
-# bursts of queries. A browser resolves 20-50 names while
-# building a single page, so the throttling shows up as pages
-# that load slowly or time out - while a single lookup on the
-# command line still looks perfectly healthy.
 #
 # The addresses are replaced where netplan configures the
 # link. Name servers defined there take precedence over
@@ -500,85 +768,256 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[1/15] Configuring DNS resolvers"
+echo "[1/13] Configuring DNS resolvers"
 
-readonly DNS_PRIMARY="1.1.1.1"
-readonly DNS_SECONDARY="8.8.8.8"
+CLOUD_INIT_FILE="/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
+CLOUD_INIT_FILE_CREATED=false
 
-export DEBIAN_FRONTEND=noninteractive
 
-# "sed -n 1p" instead of "head -n1": a reader that closes the
-# pipe early kills grep with SIGPIPE, which "set -o pipefail"
-# would report as a failure.
-NETPLAN_FILE="$(grep -l 'nameservers' /etc/netplan/*.yaml 2>/dev/null | sed -n '1p' || true)"
+# A real lookup, not a ping: this is exactly what breaks when a
+# provider blocks foreign resolvers.
 
-if [[ -z "$NETPLAN_FILE" ]]; then
+dns_resolves_names() {
+    local host
 
-    echo "No netplan file with name servers found - keeping current setup."
+    for host in archive.ubuntu.com security.ubuntu.com; do
+
+        if timeout 10 getent hosts "$host" >/dev/null 2>&1; then
+            return 0
+        fi
+
+    done
+
+    return 1
+}
+
+
+restore_netplan_backup() {
+    local backup="$1"
+    local target="$2"
+
+    cp -a "$backup" "$target" || return 1
+
+    if netplan generate >/dev/null 2>&1; then
+        netplan apply >/dev/null 2>&1 || true
+        sleep 2
+    fi
+
+    if [[ "$CLOUD_INIT_FILE_CREATED" == true ]]; then
+        rm -f "$CLOUD_INIT_FILE"
+        CLOUD_INIT_FILE_CREATED=false
+    fi
+
+    return 0
+}
+
+
+if [[ "$CHANGE_DNS" == false ]]; then
+
+    echo "Skipped on request."
 
 else
 
-    echo "Setting $DNS_PRIMARY and $DNS_SECONDARY in $NETPLAN_FILE"
+    # "sed -n 1p" instead of "head -n1": a reader that closes the
+    # pipe early kills grep with SIGPIPE, which "set -o pipefail"
+    # would report as a failure.
+    NETPLAN_FILE="$(grep -l 'nameservers' /etc/netplan/*.yaml 2>/dev/null | sed -n '1p' || true)"
 
-    NETPLAN_BACKUP="${NETPLAN_FILE}.backup_$(date +%Y%m%d_%H%M%S)"
-    cp -a "$NETPLAN_FILE" "$NETPLAN_BACKUP"
+    if [[ -z "$NETPLAN_FILE" ]]; then
 
-    if ! python3 -c 'import yaml' 2>/dev/null; then
-        apt-get update
-        apt-get install -y python3-yaml
-    fi
+        echo "No netplan file with name servers found - keeping current setup."
 
-    # Rewriting the YAML is safer than a text substitution:
-    # the provider addresses differ between machines.
-    python3 - "$NETPLAN_FILE" "$DNS_PRIMARY" "$DNS_SECONDARY" <<'PYTHON'
+    else
+
+        echo "Setting $DNS_PRIMARY and $DNS_SECONDARY in $NETPLAN_FILE"
+
+        # Whether name resolution worked BEFORE anything was
+        # touched. Without this, a server that arrived with broken
+        # DNS would later be blamed on the new name servers.
+        if dns_resolves_names; then
+            DNS_WORKED_BEFORE=true
+        else
+            DNS_WORKED_BEFORE=false
+            echo "NOTE: Name resolution is already not working on this server."
+        fi
+
+        DNS_STEP_OK=true
+
+        NETPLAN_BACKUP="${NETPLAN_FILE}.backup_$(date +%Y%m%d_%H%M%S)"
+
+        # No backup, no change: without a way back, editing the
+        # file that carries the network configuration is reckless.
+        if ! cp -a "$NETPLAN_FILE" "$NETPLAN_BACKUP"; then
+            warn "Could not back up $NETPLAN_FILE - the name servers were left unchanged."
+            DNS_STEP_OK=false
+        fi
+
+        if [[ "$DNS_STEP_OK" == true ]] &&
+           ! python3 -c 'import yaml' 2>/dev/null; then
+
+            if ! apt-get update ||
+               ! apt-get install -y python3-yaml; then
+
+                warn "Could not install python3-yaml - name servers were not changed."
+                DNS_STEP_OK=false
+
+            fi
+
+        fi
+
+        # Rewriting the YAML is safer than a text substitution:
+        # the provider addresses differ between machines.
+        if [[ "$DNS_STEP_OK" == true ]]; then
+
+            if ! python3 - "$NETPLAN_FILE" "$DNS_PRIMARY" "$DNS_SECONDARY" <<'PYTHON'
 import sys
+
 import yaml
 
 path, primary, secondary = sys.argv[1], sys.argv[2], sys.argv[3]
 
+DEVICE_TYPES = ("ethernets", "bonds", "bridges", "vlans", "wifis")
+
 with open(path) as handle:
     config = yaml.safe_load(handle) or {}
 
-devices = config.get("network", {}).get("ethernets", {})
+network = config.get("network")
 
-if not devices:
-    sys.exit("no ethernet device found in netplan configuration")
+if not isinstance(network, dict):
+    sys.exit("no 'network' section in the netplan configuration")
 
-for device in devices.values():
-    device.setdefault("nameservers", {})["addresses"] = [primary, secondary]
+changed = 0
+
+for device_type in DEVICE_TYPES:
+
+    devices = network.get(device_type)
+
+    if not isinstance(devices, dict):
+        continue
+
+    for device in devices.values():
+
+        if not isinstance(device, dict):
+            continue
+
+        nameservers = device.get("nameservers")
+
+        if not isinstance(nameservers, dict):
+            nameservers = {}
+            device["nameservers"] = nameservers
+
+        nameservers["addresses"] = [primary, secondary]
+        changed += 1
+
+if changed == 0:
+    sys.exit("no network device found in the netplan configuration")
 
 with open(path, "w") as handle:
     yaml.safe_dump(config, handle, default_flow_style=False, sort_keys=False)
 PYTHON
+            then
 
-    chmod 600 "$NETPLAN_FILE"
+                warn "The netplan file could not be rewritten - keeping the original."
 
-    # "netplan generate" only validates the files and writes the
-    # backend configuration. It does not touch the running network,
-    # so a broken file is caught before it can cut the connection.
-    if netplan generate; then
+                if ! cp -a "$NETPLAN_BACKUP" "$NETPLAN_FILE"; then
+                    warn "The original netplan file could not be restored from $NETPLAN_BACKUP."
+                fi
 
-        netplan apply
-        sleep 2
+                DNS_STEP_OK=false
 
-        echo "Name servers now in use:"
-        resolvectl status 2>/dev/null \
-            | grep -i 'DNS Server' \
-            | sed 's/^/  /' || true
+            fi
 
-    else
+        fi
 
-        echo "WARNING: netplan rejected the change - restoring the backup."
-        cp -a "$NETPLAN_BACKUP" "$NETPLAN_FILE"
-        netplan generate || true
+        if [[ "$DNS_STEP_OK" == true ]]; then
 
-    fi
+            # netplan warns about world readable configuration files.
+            if ! chmod 600 "$NETPLAN_FILE"; then
+                warn "Could not tighten the permissions of $NETPLAN_FILE."
+            fi
 
-    # Without this, cloud-init writes the provider's name servers
-    # back into the file on the next boot.
-    if [[ -d /etc/cloud/cloud.cfg.d ]]; then
-        echo 'network: {config: disabled}' \
-            > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+            # "netplan generate" only validates the files and writes the
+            # backend configuration. It does not touch the running network,
+            # so a broken file is caught before it can cut the connection.
+            if ! netplan generate; then
+
+                warn "netplan rejected the change - the backup was restored."
+                restore_netplan_backup "$NETPLAN_BACKUP" "$NETPLAN_FILE" || true
+                DNS_STEP_OK=false
+
+            fi
+
+        fi
+
+        if [[ "$DNS_STEP_OK" == true ]]; then
+
+            if ! netplan apply; then
+
+                warn "netplan could not apply the new name servers - the backup was restored."
+                restore_netplan_backup "$NETPLAN_BACKUP" "$NETPLAN_FILE" || true
+                DNS_STEP_OK=false
+
+            else
+
+                sleep 2
+
+            fi
+
+        fi
+
+        if [[ "$DNS_STEP_OK" == true ]]; then
+
+            # Without this, cloud-init writes the provider's name servers
+            # back into the file on the next boot.
+            if [[ -d /etc/cloud/cloud.cfg.d && ! -f "$CLOUD_INIT_FILE" ]]; then
+
+                echo 'network: {config: disabled}' > "$CLOUD_INIT_FILE"
+                CLOUD_INIT_FILE_CREATED=true
+
+            fi
+
+            # The safety net. Some providers block foreign resolvers
+            # completely; without this check the installation would
+            # die at the next apt command, on a server that has no
+            # working name resolution left.
+            echo "Checking name resolution..."
+
+            if dns_resolves_names; then
+
+                echo "Name servers now in use:"
+                LC_ALL=C resolvectl status 2>/dev/null \
+                    | grep -i 'DNS Server' \
+                    | sed 's/^/  /' || true
+
+            else
+
+                warn "No name resolution with $DNS_PRIMARY / $DNS_SECONDARY - the previous name servers were restored."
+
+                restore_netplan_backup "$NETPLAN_BACKUP" "$NETPLAN_FILE" || true
+
+                if dns_resolves_names; then
+
+                    echo "Name resolution works again with the previous name servers."
+                    echo "This network apparently blocks external resolvers."
+
+                else
+
+                    echo "ERROR: This server has no working name resolution." >&2
+
+                    if [[ "$DNS_WORKED_BEFORE" == false ]]; then
+                        echo "       It was already broken before this installer ran," >&2
+                        echo "       so the cause is not the name server change." >&2
+                    fi
+
+                    echo "       The installation cannot continue." >&2
+                    exit 1
+
+                fi
+
+            fi
+
+        fi
+
     fi
 
 fi
@@ -589,12 +1028,152 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[2/15] Updating system"
-
-export DEBIAN_FRONTEND=noninteractive
+echo "[2/13] Updating system"
 
 apt-get update
-apt-get upgrade -y
+
+if ! apt-get upgrade -y; then
+    warn "Not all packages could be upgraded. The installation continues."
+fi
+
+
+# ----------------------------------------------------------
+# FIREWALL
+#
+# Deliberately BEFORE XRDP is installed. A freshly installed
+# xrdp starts on port 3389 immediately, and on a server with
+# no firewall that port would be open to the Internet for the
+# rest of the installation.
+# ----------------------------------------------------------
+
+echo
+echo "[3/13] Configuring UFW"
+
+if ! command -v ufw >/dev/null 2>&1; then
+
+    if ! apt-get install -y ufw; then
+        echo "ERROR: UFW could not be installed." >&2
+        echo "       Refusing to continue without a firewall." >&2
+        exit 1
+    fi
+
+fi
+
+echo "Preserving SSH access on port(s): ${SSH_PORTS[*]}"
+
+for SSH_PORT in "${SSH_PORTS[@]}"; do
+
+    ufw allow \
+        "${SSH_PORT}/tcp" \
+        comment "SSH"
+
+done
+
+
+# ----------------------------------------------------------
+# REMOVE OLD RDP FIREWALL RULES
+#
+# Removes rules for the default port, for the configured port,
+# and every rule this installer created earlier - the last one
+# matters when a previous run used a different port, whose
+# rule would otherwise stay open forever.
+# ----------------------------------------------------------
+
+UFW_ADDED_RULES="$(
+    LC_ALL=C ufw show added 2>/dev/null || true
+)"
+
+while IFS= read -r UFW_LINE; do
+
+    [[ "$UFW_LINE" == ufw\ * ]] || continue
+
+    RULE="${UFW_LINE#ufw }"
+
+    IS_RDP_RULE=false
+
+    # Rules written by an earlier run carry this comment, no
+    # matter which port they use.
+    if [[ "$RULE" == *"comment 'XRDP'"* ]]; then
+        IS_RDP_RULE=true
+    fi
+
+    # Remove optional comment.
+    RULE="${RULE%% comment *}"
+
+    for CHECK_PORT in "$DEFAULT_RDP_PORT" "$RDP_PORT"; do
+
+        # Examples:
+        #
+        # allow 3389
+        # allow 3389/tcp
+
+        if [[ "$RULE" =~ ^(allow|deny|reject|limit)[[:space:]]+${CHECK_PORT}(/tcp)?([[:space:]]|$) ]]; then
+            IS_RDP_RULE=true
+        fi
+
+        # Example:
+        #
+        # allow from 203.0.113.10 to any port 3389 proto tcp
+
+        if [[ "$RULE" =~ to[[:space:]]+any[[:space:]]+port[[:space:]]+${CHECK_PORT}([[:space:]]|$) ]]; then
+            IS_RDP_RULE=true
+        fi
+
+    done
+
+    if [[ "$IS_RDP_RULE" == true ]]; then
+
+        echo "Removing existing RDP firewall rule:"
+        echo "  ufw $RULE"
+
+        read -r -a RULE_ARGS <<< "$RULE"
+
+        if ! ufw delete "${RULE_ARGS[@]}"; then
+
+            echo >&2
+            echo "ERROR: Failed to remove an existing RDP firewall rule:" >&2
+            echo "  ufw $RULE" >&2
+            echo >&2
+            echo "Firewall configuration aborted." >&2
+            echo "An old public RDP rule may still be active." >&2
+
+            exit 1
+        fi
+
+    fi
+
+done <<< "$UFW_ADDED_RULES"
+
+
+# ----------------------------------------------------------
+# FIREWALL DEFAULTS AND RDP RULE
+# ----------------------------------------------------------
+
+ufw default deny incoming
+ufw default allow outgoing
+
+if [[ "$LIMIT_RDP" =~ ^[Yy]$ ]]; then
+
+    ufw allow \
+        from "$ALLOWED_IP" \
+        to any \
+        port "$RDP_PORT" \
+        proto tcp \
+        comment "XRDP"
+
+    echo "RDP access restricted to: $ALLOWED_IP"
+
+else
+
+    ufw allow \
+        "${RDP_PORT}/tcp" \
+        comment "XRDP"
+
+    echo "WARNING: RDP is accessible from any IP."
+
+fi
+
+ufw --force enable
 
 
 # ----------------------------------------------------------
@@ -602,10 +1181,22 @@ apt-get upgrade -y
 # ----------------------------------------------------------
 
 echo
-echo "[3/15] Installing XFCE, XRDP and dependencies"
+echo "[4/13] Installing XFCE, XRDP and dependencies"
+
+# sudo is not in this list on purpose. Ubuntu 26.04 ships
+# sudo-rs as the default provider; installing the package
+# blindly would change a working setup for no reason.
+
+if ! command -v sudo >/dev/null 2>&1; then
+
+    if ! apt-get install -y sudo; then
+        echo "ERROR: sudo could not be installed." >&2
+        exit 1
+    fi
+
+fi
 
 apt-get install -y \
-    sudo \
     xfce4 \
     xfce4-goodies \
     xrdp \
@@ -613,7 +1204,6 @@ apt-get install -y \
     xserver-xorg-core \
     dbus-x11 \
     x11-xserver-utils \
-    ufw \
     fail2ban \
     tmux \
     wget \
@@ -643,12 +1233,14 @@ fi
 if [[ -n "$POLKIT_PKG" ]]; then
 
     echo "Installing polkit package: $POLKIT_PKG"
-    apt-get install -y "$POLKIT_PKG"
+
+    if ! apt-get install -y "$POLKIT_PKG"; then
+        warn "The polkit package $POLKIT_PKG could not be installed."
+    fi
 
 else
 
-    echo "WARNING: No supported polkit package was found."
-    echo "XRDP installation will continue."
+    warn "No supported polkit package was found."
 
 fi
 
@@ -681,12 +1273,12 @@ if [[ -n "$FUSE_PKG" ]]; then
     echo "Installing FUSE 2 package for AppImage support: $FUSE_PKG"
 
     if ! apt-get install -y "$FUSE_PKG" fuse3; then
-        echo "WARNING: FUSE installation failed. AppImages may not start."
+        warn "FUSE installation failed. AppImages may not start."
     fi
 
 else
 
-    echo "WARNING: No FUSE 2 package found. AppImages may not start."
+    warn "No FUSE 2 package found. AppImages may not start."
 
 fi
 
@@ -696,26 +1288,30 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[4/15] Configuring XRDP"
+echo "[5/13] Configuring XRDP"
 
 if getent group ssl-cert >/dev/null 2>&1; then
-    usermod -aG ssl-cert xrdp
+
+    if ! usermod -aG ssl-cert xrdp; then
+        warn "Could not add the xrdp user to the ssl-cert group."
+    fi
+
 fi
 
 XRDP_INI="/etc/xrdp/xrdp.ini"
 SESMAN_INI="/etc/xrdp/sesman.ini"
 
 if [[ -f "$XRDP_INI" && ! -f "${XRDP_INI}.orig" ]]; then
-    cp "$XRDP_INI" "${XRDP_INI}.orig"
+    cp -a "$XRDP_INI" "${XRDP_INI}.orig"
 fi
 
 if [[ -f "$SESMAN_INI" && ! -f "${SESMAN_INI}.orig" ]]; then
-    cp "$SESMAN_INI" "${SESMAN_INI}.orig"
+    cp -a "$SESMAN_INI" "${SESMAN_INI}.orig"
 fi
 
 # Listening port.
 
-set_ini_key "$XRDP_INI" "port" "$RDP_PORT"
+set_ini_key "$XRDP_INI" "Globals" "port" "$RDP_PORT" || true
 
 # Fixed colour depth.
 #
@@ -725,7 +1321,7 @@ set_ini_key "$XRDP_INI" "port" "$RDP_PORT"
 #
 # Capping the value keeps all clients in one single session.
 
-set_ini_key "$XRDP_INI" "max_bpp" "24"
+set_ini_key "$XRDP_INI" "Globals" "max_bpp" "24" || true
 
 
 # ----------------------------------------------------------
@@ -744,17 +1340,17 @@ set_ini_key "$XRDP_INI" "max_bpp" "24"
 # ----------------------------------------------------------
 
 echo
-echo "[5/15] Configuring persistent sessions"
+echo "[6/13] Configuring persistent sessions"
 
-set_ini_key "$SESMAN_INI" "Policy" "Default"
-set_ini_key "$SESMAN_INI" "KillDisconnected" "false"
-set_ini_key "$SESMAN_INI" "DisconnectedTimeLimit" "0"
-set_ini_key "$SESMAN_INI" "IdleTimeLimit" "0"
+set_ini_key "$SESMAN_INI" "Sessions" "Policy" "Default" || true
+set_ini_key "$SESMAN_INI" "Sessions" "KillDisconnected" "false" || true
+set_ini_key "$SESMAN_INI" "Sessions" "DisconnectedTimeLimit" "0" || true
+set_ini_key "$SESMAN_INI" "Sessions" "IdleTimeLimit" "0" || true
 
 # A low limit surfaces stale sessions early instead of
 # letting dozens of them pile up unnoticed.
 
-set_ini_key "$SESMAN_INI" "MaxSessions" "3"
+set_ini_key "$SESMAN_INI" "Sessions" "MaxSessions" "3" || true
 
 systemctl enable xrdp
 
@@ -767,7 +1363,7 @@ systemctl restart xrdp
 # ----------------------------------------------------------
 
 echo
-echo "[6/15] Configuring user '$USERNAME'"
+echo "[7/13] Configuring user '$USERNAME'"
 
 if [[ "$USER_EXISTS" == false ]]; then
 
@@ -818,7 +1414,7 @@ USER_GROUP="$(id -gn "$USERNAME")"
 # ----------------------------------------------------------
 
 echo
-echo "[7/15] Configuring XFCE session"
+echo "[8/13] Configuring XFCE session"
 
 cat > "$HOME_DIR/.xsession" <<'EOF'
 exec startxfce4
@@ -838,11 +1434,11 @@ chmod 0644 "$HOME_DIR/.xsession"
 # ----------------------------------------------------------
 
 echo
-echo "[8/15] Configuring polkit for XRDP"
+echo "[9/13] Configuring polkit for XRDP"
 
 if command -v pkaction >/dev/null 2>&1; then
 
-    POLKIT_OUTPUT="$(pkaction --version 2>/dev/null || true)"
+    POLKIT_OUTPUT="$(LC_ALL=C pkaction --version 2>/dev/null || true)"
     POLKIT_VERSION="${POLKIT_OUTPUT##* }"
     POLKIT_MAJOR="${POLKIT_VERSION%%.*}"
 
@@ -920,200 +1516,9 @@ EOF
 
 else
 
-    echo "WARNING: pkaction was not found."
-    echo "Skipping XRDP polkit configuration."
+    warn "pkaction was not found - the XRDP polkit configuration was skipped."
 
 fi
-
-
-# ----------------------------------------------------------
-# FIREWALL
-# ----------------------------------------------------------
-
-echo
-echo "[9/15] Configuring UFW"
-
-declare -a SSH_PORTS=()
-
-
-add_ssh_port() {
-
-    local port="$1"
-    local existing
-
-    [[ "$port" =~ ^[0-9]+$ ]] || return 0
-
-    if (( port < 1 || port > 65535 )); then
-        return 0
-    fi
-
-    for existing in "${SSH_PORTS[@]}"; do
-
-        if [[ "$existing" == "$port" ]]; then
-            return 0
-        fi
-
-    done
-
-    SSH_PORTS+=("$port")
-}
-
-
-# ----------------------------------------------------------
-# CURRENT SSH CONNECTION
-#
-# Preserve the SSH port used by this connection.
-# ----------------------------------------------------------
-
-if [[ -n "${SSH_CONNECTION:-}" ]]; then
-
-    read -r _ _ _ SSH_CURRENT_PORT <<< "$SSH_CONNECTION"
-
-    add_ssh_port "$SSH_CURRENT_PORT"
-
-fi
-
-
-# ----------------------------------------------------------
-# EFFECTIVE SSHD CONFIGURATION
-# ----------------------------------------------------------
-
-if command -v sshd >/dev/null 2>&1; then
-
-    SSHD_CONFIG="$(sshd -T 2>/dev/null || true)"
-
-    while read -r KEY VALUE _; do
-
-        if [[ "$KEY" == "port" ]]; then
-            add_ssh_port "$VALUE"
-        fi
-
-    done <<< "$SSHD_CONFIG"
-
-fi
-
-
-# ----------------------------------------------------------
-# SSH FALLBACK
-# ----------------------------------------------------------
-
-if (( ${#SSH_PORTS[@]} == 0 )); then
-    add_ssh_port 22
-fi
-
-echo "Preserving SSH access on port(s): ${SSH_PORTS[*]}"
-
-for SSH_PORT in "${SSH_PORTS[@]}"; do
-
-    ufw allow \
-        "${SSH_PORT}/tcp" \
-        comment "SSH"
-
-done
-
-
-# ----------------------------------------------------------
-# REMOVE OLD RDP FIREWALL RULES
-#
-# Removes existing rules for the default port and for the
-# configured port, so an old "ALLOW Anywhere" rule cannot
-# survive the installation.
-# ----------------------------------------------------------
-
-UFW_ADDED_RULES="$(
-    LC_ALL=C ufw show added 2>/dev/null || true
-)"
-
-while IFS= read -r UFW_LINE; do
-
-    [[ "$UFW_LINE" == ufw\ * ]] || continue
-
-    RULE="${UFW_LINE#ufw }"
-
-    # Remove optional comment.
-    RULE="${RULE%% comment *}"
-
-    IS_RDP_RULE=false
-
-    for CHECK_PORT in 3389 "$RDP_PORT"; do
-
-        # Examples:
-        #
-        # allow 3389
-        # allow 3389/tcp
-
-        if [[ "$RULE" =~ ^(allow|deny|reject|limit)[[:space:]]+${CHECK_PORT}(/tcp)?([[:space:]]|$) ]]; then
-            IS_RDP_RULE=true
-        fi
-
-        # Example:
-        #
-        # allow from 203.0.113.10 to any port 3389 proto tcp
-
-        if [[ "$RULE" =~ to[[:space:]]+any[[:space:]]+port[[:space:]]+${CHECK_PORT}([[:space:]]|$) ]]; then
-            IS_RDP_RULE=true
-        fi
-
-    done
-
-    if [[ "$IS_RDP_RULE" == true ]]; then
-
-        echo "Removing existing RDP firewall rule:"
-        echo "  ufw $RULE"
-
-        read -r -a RULE_ARGS <<< "$RULE"
-
-        if ! ufw delete "${RULE_ARGS[@]}"; then
-
-            echo >&2
-            echo "ERROR: Failed to remove an existing RDP firewall rule:" >&2
-            echo "  ufw $RULE" >&2
-            echo >&2
-            echo "Firewall configuration aborted." >&2
-            echo "An old public RDP rule may still be active." >&2
-
-            exit 1
-        fi
-
-    fi
-
-done <<< "$UFW_ADDED_RULES"
-
-
-# ----------------------------------------------------------
-# FIREWALL DEFAULTS
-# ----------------------------------------------------------
-
-ufw default deny incoming
-ufw default allow outgoing
-
-
-# ----------------------------------------------------------
-# RDP FIREWALL RULE
-# ----------------------------------------------------------
-
-if [[ "$LIMIT_RDP" =~ ^[Yy]$ ]]; then
-
-    ufw allow \
-        from "$ALLOWED_IP" \
-        to any \
-        port "$RDP_PORT" \
-        proto tcp \
-        comment "XRDP"
-
-    echo "RDP access restricted to: $ALLOWED_IP"
-
-else
-
-    ufw allow \
-        "${RDP_PORT}/tcp" \
-        comment "XRDP"
-
-    echo "WARNING: RDP is accessible from any IP."
-
-fi
-
-ufw --force enable
 
 
 # ----------------------------------------------------------
@@ -1123,29 +1528,62 @@ ufw --force enable
 # open for everyone else.
 #
 # Ubuntu ships a filter for SSH only, so the XRDP filter is
-# created here.
+# created here - under its own name, so a future distribution
+# filter called xrdp.conf cannot collide with it.
 # ----------------------------------------------------------
 
 echo
-echo "[10/15] Configuring fail2ban"
+echo "[10/13] Configuring fail2ban"
 
-SESMAN_LOG="/var/log/xrdp-sesman.log"
-
-cat > /etc/fail2ban/filter.d/xrdp.conf <<'EOF'
+cat > "$XRDP_FILTER" <<'EOF'
 # Matches the AUTHFAIL line written by xrdp-sesman, e.g.
 #
-#   [20260101-12:00:00] [INFO ] AUTHFAIL: user=name ip=::ffff:203.0.113.10 time=...
+#   [20260101-12:00:00] [INFO ] AUTHFAIL: user=name ip=::ffff:203.0.113.10 time=1767265200
 #
 # The optional ::ffff: prefix is how an IPv4 address is
-# represented inside an IPv6 field.
+# represented inside an IPv6 field. It is matched but NOT
+# captured: capturing it would put an unusable IPv6 address
+# into the ban rule.
+#
+# The leading "[...]" blocks are optional and repeatable on
+# purpose. fail2ban normally cuts the timestamp off before
+# matching, which leaves "[INFO ] AUTHFAIL: ...", but if
+# datepattern ever stops matching, the full line arrives here
+# with both blocks. A pattern that only allows one of them
+# would then match nothing at all - and a jail that matches
+# nothing looks healthy while banning nobody.
 
 [Definition]
-failregex = AUTHFAIL: user=\S* ip=(?:::ffff:)?<HOST>
+failregex = ^(?:\s*\[[^\]]*\])*\s*AUTHFAIL:\s+user=\S*\s+ip=(?:::ffff:)?<HOST>\s+time=\d+\s*$
 ignoreregex =
 datepattern = ^\[%%Y%%m%%d-%%H:%%M:%%S\]
 EOF
 
-chmod 0644 /etc/fail2ban/filter.d/xrdp.conf
+chmod 0644 "$XRDP_FILTER"
+
+
+# The sshd jail must know the real SSH port. fail2ban bans an
+# address per port: with the default "port = ssh" a ban only
+# covers port 22, so on a server with a custom SSH port the
+# jail looks healthy and blocks nobody.
+
+SSH_PORT_LIST="$(IFS=,; echo "${SSH_PORTS[*]}")"
+
+# Minimal Ubuntu images no longer install rsyslog, so
+# /var/log/auth.log may not exist at all. fail2ban then finds
+# no log file and quietly refuses to start the sshd jail.
+
+if [[ -f /var/log/auth.log ]]; then
+    SSHD_BACKEND="auto"
+    SSHD_LOGPATH_LINE="logpath  = /var/log/auth.log"
+else
+    SSHD_BACKEND="systemd"
+    SSHD_LOGPATH_LINE="# no auth.log on this system, reading the journal instead"
+fi
+
+# "polling" instead of "auto": xrdp writes to a plain file,
+# and polling is the one backend that works on every system,
+# with or without pyinotify.
 
 cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
@@ -1155,14 +1593,17 @@ maxretry = 5
 ignoreip = 127.0.0.1/8 ::1
 
 [sshd]
-enabled = true
+enabled  = true
+port     = $SSH_PORT_LIST
+backend  = $SSHD_BACKEND
+$SSHD_LOGPATH_LINE
 
 [xrdp]
 enabled  = true
 port     = $RDP_PORT
-filter   = xrdp
+filter   = xrdp-sesman
 logpath  = $SESMAN_LOG
-backend  = auto
+backend  = polling
 maxretry = 5
 bantime  = 1h
 EOF
@@ -1176,8 +1617,70 @@ if [[ ! -f "$SESMAN_LOG" ]]; then
     chmod 0640 "$SESMAN_LOG"
 fi
 
-systemctl enable fail2ban
-systemctl restart fail2ban
+
+# Proof that the filter really matches. A jail without a
+# matching filter runs "green" and bans nobody, which is worse
+# than no protection at all, because it is not noticed.
+
+verify_xrdp_filter() {
+    local sample_log
+    local output
+
+    if ! command -v fail2ban-regex >/dev/null 2>&1; then
+        warn "fail2ban-regex not found - the XRDP filter could not be verified."
+        return 1
+    fi
+
+    if ! sample_log="$(mktemp)"; then
+        return 1
+    fi
+
+    # Two genuine AUTHFAIL lines: one with the ::ffff: prefix,
+    # one without.
+    cat > "$sample_log" <<'EOF'
+[20260101-12:00:00] [INFO ] AUTHFAIL: user=testuser ip=::ffff:203.0.113.10 time=1767265200
+[20260101-12:00:05] [INFO ] AUTHFAIL: user=testuser ip=198.51.100.23 time=1767265205
+EOF
+
+    output="$(fail2ban-regex "$sample_log" "$XRDP_FILTER" 2>&1 || true)"
+    rm -f "$sample_log"
+
+    if [[ "$output" != *"2 matched"* ]]; then
+        warn "The XRDP fail2ban filter did not match the test lines - RDP brute force protection is probably not working."
+        return 1
+    fi
+
+    echo "XRDP filter check: 2 of 2 test lines matched."
+
+    # A test line only proves that the filter matches the format
+    # this installer knows. If the server has already logged real
+    # failed logins, check against those as well - they are the
+    # only evidence that the format has not changed.
+    if grep -q 'AUTHFAIL:' "$SESMAN_LOG" 2>/dev/null; then
+
+        output="$(fail2ban-regex "$SESMAN_LOG" "$XRDP_FILTER" 2>&1 || true)"
+
+        if [[ "$output" == *" 0 matched"* ]]; then
+            warn "The XRDP filter matches no line of the existing $SESMAN_LOG - the log format may have changed."
+            return 1
+        fi
+
+        echo "XRDP filter check: existing log entries are matched as well."
+
+    fi
+
+    return 0
+}
+
+verify_xrdp_filter || true
+
+if ! systemctl enable fail2ban >/dev/null 2>&1; then
+    warn "fail2ban could not be enabled at boot."
+fi
+
+if ! systemctl restart fail2ban; then
+    warn "fail2ban did not start - SSH and RDP are not protected against brute force."
+fi
 
 
 # ----------------------------------------------------------
@@ -1185,7 +1688,7 @@ systemctl restart fail2ban
 # ----------------------------------------------------------
 
 echo
-echo "[11/15] Installing browsers"
+echo "[11/13] Installing browsers"
 
 
 # ----------------------------------------------------------
@@ -1206,20 +1709,19 @@ if [[ "$ARCH" == "amd64" ]]; then
 
         if ! apt-get install -y "$CHROME_DEB"; then
 
-            echo "WARNING: Initial Chrome installation failed."
-            echo "Attempting dependency repair..."
+            echo "Initial Chrome installation failed, attempting dependency repair..."
 
             apt-get -f install -y || true
 
             if ! apt-get install -y "$CHROME_DEB"; then
-                echo "WARNING: Google Chrome could not be installed."
+                warn "Google Chrome could not be installed."
             fi
 
         fi
 
     else
 
-        echo "WARNING: Failed to download Google Chrome."
+        warn "Failed to download Google Chrome."
 
     fi
 
@@ -1233,18 +1735,18 @@ else
     if apt-cache show chromium-browser >/dev/null 2>&1; then
 
         if ! apt-get install -y chromium-browser; then
-            echo "WARNING: Chromium installation failed."
+            warn "Chromium installation failed."
         fi
 
     elif apt-cache show chromium >/dev/null 2>&1; then
 
         if ! apt-get install -y chromium; then
-            echo "WARNING: Chromium installation failed."
+            warn "Chromium installation failed."
         fi
 
     else
 
-        echo "WARNING: Chromium package was not found."
+        warn "Chromium package was not found."
 
     fi
 
@@ -1267,38 +1769,47 @@ fi
 
 echo "Installing Firefox from Mozilla's APT repository..."
 
-# Remove the Snap build and the wrapper package first.
-if command -v snap >/dev/null 2>&1; then
-    snap remove --purge firefox >/dev/null 2>&1 || true
-fi
-
-apt-get purge -y firefox >/dev/null 2>&1 || true
+MOZILLA_KEYRING="/etc/apt/keyrings/packages.mozilla.org.asc"
+MOZILLA_KEY_TEMP="/tmp/packages.mozilla.org.asc"
 
 install -d -m 0755 /etc/apt/keyrings
 
-if wget -qO- "https://packages.mozilla.org/apt/repo-signing-key.gpg" \
-    > /etc/apt/keyrings/packages.mozilla.org.asc; then
+# Download first, install second. Redirecting wget straight
+# into the keyring would leave an empty file behind if the
+# download fails.
+if wget -qO "$MOZILLA_KEY_TEMP" "https://packages.mozilla.org/apt/repo-signing-key.gpg"; then
 
-    chmod 0644 /etc/apt/keyrings/packages.mozilla.org.asc
+    # Remove the Snap build and the wrapper package only once
+    # the replacement is known to be available.
+    if command -v snap >/dev/null 2>&1; then
+        snap remove --purge firefox >/dev/null 2>&1 || true
+    fi
 
-    echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
+    apt-get purge -y firefox >/dev/null 2>&1 || true
+
+    install -m 0644 "$MOZILLA_KEY_TEMP" "$MOZILLA_KEYRING"
+
+    echo "deb [signed-by=$MOZILLA_KEYRING] https://packages.mozilla.org/apt mozilla main" \
         > /etc/apt/sources.list.d/mozilla.list
 
     printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' \
         > /etc/apt/preferences.d/mozilla
 
-    apt-get update
+    if ! apt-get update; then
+        warn "Could not read Mozilla's APT repository."
+    fi
 
     if ! apt-get install -y firefox; then
-        echo "WARNING: Firefox installation failed."
+        warn "Firefox installation failed."
     fi
 
 else
 
-    echo "WARNING: Could not download Mozilla's signing key."
-    echo "Firefox was skipped."
+    warn "Could not download Mozilla's signing key - Firefox was skipped."
 
 fi
+
+rm -f "$MOZILLA_KEY_TEMP"
 
 
 # ----------------------------------------------------------
@@ -1306,9 +1817,7 @@ fi
 # ----------------------------------------------------------
 
 echo
-echo "[12/15] Installing optional components"
-
-JD_DIR="/opt/jdownloader"
+echo "[12/13] Installing optional components"
 
 if [[ "$JD_MODE" != "none" ]]; then
 
@@ -1327,8 +1836,7 @@ if [[ "$JD_MODE" != "none" ]]; then
     fi
 
     if ! apt-get install -y "$JAVA_PKG"; then
-        echo "WARNING: Could not install $JAVA_PKG."
-        echo "Skipping JDownloader installation."
+        warn "Could not install $JAVA_PKG - JDownloader was skipped."
         JD_MODE="none"
     fi
 
@@ -1338,15 +1846,39 @@ if [[ "$JD_MODE" != "none" ]]; then
 
     mkdir -p "$JD_DIR"
 
-    if wget \
-        -qO "$JD_DIR/JDownloader.jar" \
-        "http://installer.jdownloader.org/JDownloader.jar"; then
+    JD_JAR="$JD_DIR/JDownloader.jar"
 
-        chown -R "$USERNAME:$USER_GROUP" "$JD_DIR"
+    # https, not http: this file is started as a user with sudo
+    # rights, so an unencrypted download would be an invitation
+    # to replace it on the way.
+    if wget -qO "$JD_JAR" "https://installer.jdownloader.org/JDownloader.jar"; then
 
-        if [[ "$JD_MODE" == "service" ]]; then
+        JD_JAR_SIZE="$(stat -c '%s' "$JD_JAR" 2>/dev/null || echo 0)"
 
-            cat > /etc/systemd/system/jdownloader.service <<EOF
+        if (( JD_JAR_SIZE < MIN_JAR_SIZE_BYTES )); then
+
+            warn "The downloaded JDownloader file is too small ($JD_JAR_SIZE bytes) - JDownloader was skipped."
+            rm -f "$JD_JAR"
+            JD_MODE="none"
+
+        fi
+
+    else
+
+        warn "Failed to download JDownloader."
+        JD_MODE="none"
+
+    fi
+
+fi
+
+if [[ "$JD_MODE" != "none" ]]; then
+
+    chown -R "$USERNAME:$USER_GROUP" "$JD_DIR"
+
+    if [[ "$JD_MODE" == "service" ]]; then
+
+        cat > /etc/systemd/system/jdownloader.service <<EOF
 [Unit]
 Description=JDownloader 2 headless
 After=network-online.target
@@ -1365,18 +1897,20 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-            systemctl daemon-reload
+        systemctl daemon-reload
 
-            # Deliberately NOT started here: the first run is
-            # interactive and asks for My JDownloader credentials.
+        # Deliberately NOT started here: the first run is
+        # interactive and asks for My JDownloader credentials.
 
-            systemctl enable jdownloader
+        if ! systemctl enable jdownloader; then
+            warn "The JDownloader service could not be enabled at boot."
+        fi
 
-            echo "JDownloader service created (not started yet)."
+        echo "JDownloader service created (not started yet)."
 
-        else
+    else
 
-            cat > /usr/share/applications/jdownloader.desktop <<EOF
+        cat > /usr/share/applications/jdownloader.desktop <<EOF
 [Desktop Entry]
 Type=Application
 Name=JDownloader 2
@@ -1388,17 +1922,10 @@ Categories=Network;FileTransfer;
 StartupNotify=true
 EOF
 
-            chmod 0644 /usr/share/applications/jdownloader.desktop
-            update-desktop-database 2>/dev/null || true
+        chmod 0644 /usr/share/applications/jdownloader.desktop
+        update-desktop-database 2>/dev/null || true
 
-            echo "JDownloader menu entry created."
-
-        fi
-
-    else
-
-        echo "WARNING: Failed to download JDownloader."
-        JD_MODE="none"
+        echo "JDownloader menu entry created."
 
     fi
 
@@ -1410,6 +1937,13 @@ fi
 #
 # A stuck window manager can leave a session that refuses
 # new connections. This helper clears it from SSH.
+#
+# Killing the processes is not enough: the X server leaves a
+# socket and a lock file behind, and a new session on the same
+# display number then fails to start. Those leftovers are
+# removed here - but only for displays where no X server is
+# running any more, so a display that belongs to another
+# service is never touched.
 # ----------------------------------------------------------
 
 cat > /usr/local/bin/xrdp-session-reset <<EOF
@@ -1426,6 +1960,30 @@ echo "Terminating all processes of user '$USERNAME'..."
 pkill -u "$USERNAME" || true
 sleep 2
 
+# Anything that ignored the polite request.
+pkill -KILL -u "$USERNAME" || true
+sleep 1
+
+echo "Removing orphaned X server sockets..."
+
+for SOCKET in /tmp/.X11-unix/X*; do
+
+    [[ -e "\$SOCKET" ]] || continue
+
+    DISPLAY_NUMBER="\${SOCKET##*/X}"
+
+    [[ "\$DISPLAY_NUMBER" =~ ^[0-9]+\$ ]] || continue
+
+    # Still in use by a running X server? Then leave it alone.
+    if pgrep -af 'X(org|vfb|vnc)' 2>/dev/null |
+       grep -qE "(^| ):\${DISPLAY_NUMBER}( |\\\$)"; then
+        continue
+    fi
+
+    rm -f "\$SOCKET" "/tmp/.X\${DISPLAY_NUMBER}-lock"
+
+done
+
 systemctl restart xrdp-sesman
 systemctl restart xrdp
 
@@ -1436,135 +1994,11 @@ chmod 0755 /usr/local/bin/xrdp-session-reset
 
 
 # ----------------------------------------------------------
-# SWAP
-#
-# A small VPS can run out of memory during archive
-# extraction or a browser session, and the kernel then
-# kills the largest process without warning.
-#
-# Swap is a safety net, not a speed improvement. With
-# swappiness lowered it stays unused until memory is
-# actually tight.
-# ----------------------------------------------------------
-
-echo
-echo "[13/15] Configuring swap"
-
-if swapon --show --noheadings 2>/dev/null | grep -q .; then
-
-    echo "Swap is already active, leaving it unchanged:"
-    swapon --show
-
-elif [[ -e /swapfile ]]; then
-
-    echo "WARNING: /swapfile exists but is not active."
-    echo "Skipping to avoid touching an unknown file."
-
-else
-
-    # Half the installed memory, clamped to 2-8 GB.
-
-    MEM_MB="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)"
-    SWAP_GB=$(( MEM_MB / 2048 ))
-
-    (( SWAP_GB < 2 )) && SWAP_GB=2
-    (( SWAP_GB > 8 )) && SWAP_GB=8
-
-    # Only proceed if there is clearly enough room.
-
-    FREE_GB="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
-
-    if (( FREE_GB < SWAP_GB + 5 )); then
-
-        echo "WARNING: Not enough free disk space for a ${SWAP_GB}G swap file."
-        echo "Skipping swap configuration."
-
-    else
-
-        echo "Creating a ${SWAP_GB}G swap file..."
-
-        if fallocate -l "${SWAP_GB}G" /swapfile 2>/dev/null ||
-           dd if=/dev/zero of=/swapfile bs=1M count=$(( SWAP_GB * 1024 )) status=none; then
-
-            chmod 0600 /swapfile
-            mkswap /swapfile >/dev/null
-            swapon /swapfile
-
-            if ! grep -q '^/swapfile' /etc/fstab; then
-                cp /etc/fstab /etc/fstab.orig
-                printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
-            fi
-
-            # Use swap only when memory is genuinely short.
-
-            printf 'vm.swappiness=10\n' > /etc/sysctl.d/99-swappiness.conf
-            sysctl -p /etc/sysctl.d/99-swappiness.conf >/dev/null
-
-            echo "Swap active:"
-            swapon --show
-
-        else
-
-            echo "WARNING: Could not create the swap file."
-            rm -f /swapfile
-
-        fi
-
-    fi
-
-fi
-
-
-# ----------------------------------------------------------
-# AUTOMATIC SECURITY UPDATES
-#
-# The one-time upgrade earlier in this script covers the
-# moment of installation only. This keeps security patches
-# coming in afterwards.
-#
-# Only the security pocket is enabled, and the machine is
-# never rebooted automatically.
-# ----------------------------------------------------------
-
-echo
-echo "[14/15] Enabling automatic security updates"
-
-if ! apt-get install -y unattended-upgrades; then
-
-    echo "WARNING: Could not install unattended-upgrades."
-
-else
-
-    cat > /etc/apt/apt.conf.d/20auto-upgrades <<'AUTOUPG'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-AUTOUPG
-
-    chmod 0644 /etc/apt/apt.conf.d/20auto-upgrades
-
-    # Never reboot on its own: an unattended reboot would
-    # drop every running RDP session without warning.
-
-    cat > /etc/apt/apt.conf.d/51-no-auto-reboot <<'NOREBOOT'
-Unattended-Upgrade::Automatic-Reboot "false";
-NOREBOOT
-
-    chmod 0644 /etc/apt/apt.conf.d/51-no-auto-reboot
-
-    systemctl enable --now unattended-upgrades 2>/dev/null || true
-
-    echo "Security updates will be installed automatically."
-    echo "Automatic reboots are disabled."
-
-fi
-
-
-# ----------------------------------------------------------
 # VERIFY
 # ----------------------------------------------------------
 
 echo
-echo "[15/15] Verifying installation"
+echo "[13/13] Verifying installation"
 
 INSTALL_OK=true
 
@@ -1586,9 +2020,44 @@ fi
 
 
 if systemctl is-active --quiet fail2ban; then
+
     echo "fail2ban:     active"
+
+    # A running service says nothing about the jails. Both of
+    # them have to be there, or the protection is imaginary.
+    #
+    # fail2ban needs a moment to read its configuration, so the
+    # check waits instead of asking once and giving up.
+
+    for JAIL in sshd xrdp; do
+
+        JAIL_OK=false
+
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+
+            if fail2ban-client status "$JAIL" >/dev/null 2>&1; then
+                JAIL_OK=true
+                break
+            fi
+
+            sleep 1
+
+        done
+
+        if [[ "$JAIL_OK" == true ]]; then
+            echo "  jail $JAIL: active"
+        else
+            echo "  jail $JAIL: NOT ACTIVE"
+            warn "The fail2ban jail '$JAIL' is not active - brute force protection is incomplete."
+        fi
+
+    done
+
 else
+
     echo "fail2ban:     WARNING (not running)"
+    warn "fail2ban is not running."
+
 fi
 
 
@@ -1621,6 +2090,7 @@ if command -v ss >/dev/null 2>&1; then
         echo "RDP port:     listening on $RDP_PORT"
     else
         echo "RDP port:     WARNING (nothing listening on $RDP_PORT yet)"
+        warn "Nothing is listening on port $RDP_PORT yet."
     fi
 
 fi
@@ -1677,7 +2147,7 @@ if [[ "$JD_MODE" == "service" ]]; then
     echo " JDownloader (headless service)"
     echo
     echo " First run is interactive. As root, run:"
-    echo "   sudo -u $USERNAME java -jar $JD_DIR/JDownloader.jar"
+    echo "   sudo -u $USERNAME java -Djava.awt.headless=true -jar $JD_DIR/JDownloader.jar"
     echo
     echo " Enter the My JDownloader credentials when asked,"
     echo " wait until the device appears on my.jdownloader.org,"
@@ -1701,13 +2171,22 @@ if [[ ! "$LIMIT_RDP" =~ ^[Yy]$ ]]; then
     echo " randomly generated password remains essential."
 fi
 
-echo
-if swapon --show --noheadings 2>/dev/null | grep -q .; then
-    echo " Swap is active. Check it with: swapon --show"
+if (( ${#WARNINGS[@]} > 0 )); then
+
+    echo
+    echo " --------------------------------------------------"
+    echo " ${#WARNINGS[@]} step(s) did not complete:"
+    echo
+
+    for WARNING in "${WARNINGS[@]}"; do
+        echo "   - $WARNING"
+    done
+
+    echo
+    echo " The desktop itself is installed and working."
+
 fi
 
-echo " Security updates are installed automatically."
-echo " The server never reboots on its own."
 echo
 echo " Recommended: reboot before the first RDP login."
 echo
