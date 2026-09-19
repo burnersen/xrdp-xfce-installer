@@ -20,7 +20,7 @@ set -Eeuo pipefail
 #   - Optional: JDownloader 2 (desktop app or headless service)
 # ==========================================================
 
-readonly INSTALLER_VERSION="2.1.2"
+readonly INSTALLER_VERSION="2.1.3"
 
 readonly DNS_PRIMARY="1.1.1.1"
 readonly DNS_SECONDARY="8.8.8.8"
@@ -1090,6 +1090,17 @@ PYTHON
 
         if [[ "$DNS_STEP_OK" == true ]]; then
 
+            # use-dns only has an effect on the networkd back end.
+            # With renderer: NetworkManager the addresses above are
+            # applied, but the DHCP resolvers keep their precedence,
+            # so the change may be only half effective.
+            if grep -qE '^[[:space:]]*renderer:[[:space:]]*NetworkManager' \
+                "$NETPLAN_FILE"; then
+
+                warn "This netplan file is rendered by NetworkManager, where 'use-dns' has no effect - the DHCP name servers may keep precedence. Check with 'resolvectl status' below."
+
+            fi
+
             # netplan warns about world readable configuration files.
             if ! chmod 600 "$NETPLAN_FILE"; then
                 warn "Could not tighten the permissions of $NETPLAN_FILE."
@@ -1501,7 +1512,12 @@ set_ini_key "$XRDP_INI" "Globals" "max_bpp" "24" || true
 #
 #   Policy=Default            session per <User,BitPerPixel>
 #   KillDisconnected=false    keep the session after disconnect
-#   DisconnectedTimeLimit=0   never expire a disconnected session
+#   DisconnectedTimeLimit=0   no grace period to apply
+#
+# KillDisconnected=false is what actually keeps the session. The
+# time limit belongs to it: sesman.ini(5) says values below 60
+# are raised to 60, so the 0 is not "never expire" on its own -
+# it only matters once KillDisconnected is turned on.
 #
 # Note: together with max_bpp above, every client that asks for
 # 24 bpp or more shares one session. A client configured for a
@@ -1517,8 +1533,11 @@ set_ini_key "$SESMAN_INI" "Sessions" "KillDisconnected" "false" || true
 set_ini_key "$SESMAN_INI" "Sessions" "DisconnectedTimeLimit" "0" || true
 set_ini_key "$SESMAN_INI" "Sessions" "IdleTimeLimit" "0" || true
 
-# A low limit surfaces stale sessions early instead of
-# letting dozens of them pile up unnoticed.
+# The maximum number of simultaneous sessions sesman will hand
+# out. This is a GLOBAL limit, not a per user one: with 0 or no
+# value at all, sessions are unlimited. A low number is chosen
+# so that sessions piling up run into the limit and get noticed
+# instead of accumulating silently.
 
 set_ini_key "$SESMAN_INI" "Sessions" "MaxSessions" "3" || true
 
@@ -2056,8 +2075,35 @@ if [[ "$MOZILLA_KEY_OK" == true ]]; then
 
     install -m 0644 "$MOZILLA_KEY_TEMP" "$MOZILLA_KEYRING"
 
-    echo "deb [signed-by=$MOZILLA_KEYRING] https://packages.mozilla.org/apt mozilla main" \
-        > /etc/apt/sources.list.d/mozilla.list
+    # Ubuntu 26.04 and newer: the deb822 ".sources" layout, which is
+    # what Mozilla documents there and what apt prefers. The old
+    # one-line ".list" format still works - Debian does not plan to
+    # drop it before 2029 - but it draws a deprecation warning on
+    # every apt run.
+    #
+    # A ".list" left over from an earlier run of this installer is
+    # removed, or the repository would be configured twice.
+    if dpkg --compare-versions "$UBUNTU_VERSION" ge "26.04"; then
+
+        cat > /etc/apt/sources.list.d/mozilla.sources <<EOF
+Types: deb
+URIs: https://packages.mozilla.org/apt
+Suites: mozilla
+Components: main
+Signed-By: $MOZILLA_KEYRING
+EOF
+
+        chmod 0644 /etc/apt/sources.list.d/mozilla.sources
+        rm -f /etc/apt/sources.list.d/mozilla.list
+
+    else
+
+        echo "deb [signed-by=$MOZILLA_KEYRING] https://packages.mozilla.org/apt mozilla main" \
+            > /etc/apt/sources.list.d/mozilla.list
+
+        rm -f /etc/apt/sources.list.d/mozilla.sources
+
+    fi
 
     printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' \
         > /etc/apt/preferences.d/mozilla
