@@ -378,8 +378,21 @@ if [[ -n "${SSH_CONNECTION:-}" ]]; then
 fi
 
 # The effective sshd configuration.
+#
+# "sshd -T" aborts with exit code 255 when /run/sshd is
+# missing - and on a socket activated Ubuntu that has not seen
+# an SSH connection since boot it IS missing, because
+# ssh.service creates it and ssh.service has not run yet.
+# Without the directory this step would silently contribute
+# nothing, and the real SSH port could stay out of the
+# firewall rules.
 
 if command -v sshd >/dev/null 2>&1; then
+
+    if [[ ! -d /run/sshd ]]; then
+        mkdir -p /run/sshd
+        chmod 0755 /run/sshd
+    fi
 
     SSHD_CONFIG="$(sshd -T 2>/dev/null || true)"
 
@@ -390,6 +403,38 @@ if command -v sshd >/dev/null 2>&1; then
         fi
 
     done <<< "$SSHD_CONFIG"
+
+fi
+
+# The ports of ssh.socket.
+#
+# Ubuntu 22.10 and newer start sshd through socket activation.
+# The listening port then lives in the systemd unit, and
+# "sshd -T" happily reports 22 while the server really answers
+# somewhere else entirely - a server whose port was moved the
+# way most guides describe it looks like a port 22 server here.
+#
+# "systemctl cat" prints the unit together with every drop-in,
+# including the one the sshd-socket-generator produces, so this
+# sees the ports that are really configured.
+#
+# Every number found is allowed. A port that is listed but no
+# longer used only means one extra firewall rule; a port that
+# is used but not listed means no way back into the server.
+
+if command -v systemctl >/dev/null 2>&1; then
+
+    SSH_SOCKET_UNIT="$(systemctl cat ssh.socket 2>/dev/null || true)"
+
+    while read -r LISTEN_VALUE; do
+
+        # 0.0.0.0:22 -> 22,  [::]:22 -> 22,  22 -> 22
+        add_ssh_port "${LISTEN_VALUE##*:}"
+
+    done < <(
+        printf '%s\n' "$SSH_SOCKET_UNIT" |
+            awk -F= '/^[[:space:]]*ListenStream=/ && $2 != "" { print $2 }'
+    )
 
 fi
 
@@ -2107,6 +2152,88 @@ chmod 0755 /usr/local/bin/xrdp-session-reset
 
 
 # ----------------------------------------------------------
+# SSH PORT HINT
+#
+# SSH is still on port 22 after this installation, which is
+# where every scanner in the world knocks first. Moving it is
+# a separate step on purpose: done carelessly it locks you out
+# of your own server, so it wants its own script, its own test
+# and its own way back.
+#
+# This hint is printed by pam_motd on every SSH login, for as
+# long as there is something to say. It goes quiet by itself
+# once SSH has left port 22.
+#
+# The same file is written by ssh-port.sh, with the same
+# content, so the hint exists whether or not install.sh ran.
+# ----------------------------------------------------------
+
+if [[ -d /etc/update-motd.d ]]; then
+
+    cat > /etc/update-motd.d/99-xrdp-ssh-port <<'MOTD_EOF'
+#!/bin/sh
+# Installed by the XRDP + XFCE installer (ssh-port.sh).
+#
+# Prints a hint while SSH is still on port 22, and a warning
+# while a port change is waiting to be confirmed. Silent
+# otherwise, so it disappears on its own once the job is done.
+#
+# Switch it off for good:  touch /etc/xrdp-ssh-port-hint-off
+# Remove it:               rm /etc/update-motd.d/99-xrdp-ssh-port
+
+[ -f /etc/xrdp-ssh-port-hint-off ] && exit 0
+
+STATE=/var/lib/xrdp-ssh-port/pending
+
+if [ -f "$STATE" ]; then
+
+    NEW_PORT=$(sed -n 's/^NEW_PORT="\(.*\)"$/\1/p' "$STATE" 2>/dev/null)
+    DEADLINE=$(sed -n 's/^DEADLINE="\(.*\)"$/\1/p' "$STATE" 2>/dev/null)
+
+    echo
+    echo " ==> An SSH port change is WAITING FOR CONFIRMATION."
+    echo
+    echo "     New port: ${NEW_PORT:-unknown}   Port 22 is still open."
+    echo "     Everything is put back automatically at ${DEADLINE:-the deadline}."
+    echo
+    echo "     If you are reading this ON the new port, finish it:"
+    echo "         sudo xrdp-ssh-port --confirm"
+    echo "     To undo it now:"
+    echo "         sudo xrdp-ssh-port --rollback"
+    echo
+    exit 0
+fi
+
+command -v ss >/dev/null 2>&1 || exit 0
+
+# Still on 22? Then there is an offer to make.
+if [ -n "$(ss -Htnl '( sport = :22 )' 2>/dev/null)" ]; then
+    echo
+    echo " ==> SSH is on the default port 22, where every bot knocks."
+    echo "     You can move it to a port of your choice. The change is"
+    echo "     tested from a second terminal first, and port 22 is only"
+    echo "     closed once that test worked:"
+    echo
+    if [ -x /usr/local/sbin/xrdp-ssh-port ]; then
+        echo "         sudo xrdp-ssh-port"
+    else
+        echo "         curl -fsSLo ssh-port.sh https://raw.githubusercontent.com/burnersen/xrdp-xfce-installer/refs/heads/main/ssh-port.sh"
+        echo "         sudo bash ssh-port.sh"
+    fi
+    echo
+    echo "     Not interested?  sudo touch /etc/xrdp-ssh-port-hint-off"
+    echo
+fi
+
+exit 0
+MOTD_EOF
+
+    chmod 0755 /etc/update-motd.d/99-xrdp-ssh-port
+
+fi
+
+
+# ----------------------------------------------------------
 # UPDATE POLICY
 #
 # Moves the update work to boot time, the one moment when no
@@ -2452,6 +2579,48 @@ echo "   fail2ban-client status sshd"
 echo "   fail2ban-client status xrdp"
 echo "   fail2ban-client set xrdp unbanip <IP>"
 echo "   xrdp-session-reset"
+
+
+# ----------------------------------------------------------
+# WHAT IS LEFT TO DO
+#
+# Only mentioned when SSH is actually still on 22. On a server
+# whose port was already moved, this would be noise.
+# ----------------------------------------------------------
+
+SSH_ON_DEFAULT_PORT=false
+
+for SSH_PORT in "${SSH_PORTS[@]}"; do
+
+    if (( SSH_PORT == 22 )); then
+        SSH_ON_DEFAULT_PORT=true
+    fi
+
+done
+
+if [[ "$SSH_ON_DEFAULT_PORT" == true ]]; then
+
+    echo
+    echo " Optional next step: move SSH off port 22"
+    echo
+    echo " RDP is on a port of your choosing and behind fail2ban,"
+    echo " but SSH is still on 22, where the scanners are. Moving"
+    echo " it is a separate script, because done carelessly it"
+    echo " locks you out of your own server:"
+    echo
+    echo "   curl -fsSLo ssh-port.sh https://raw.githubusercontent.com/burnersen/xrdp-xfce-installer/refs/heads/main/ssh-port.sh"
+    echo "   bash ssh-port.sh"
+    echo
+    echo " It opens the new port NEXT TO 22, waits until you have"
+    echo " logged in on it from a second terminal, and only then"
+    echo " closes 22 - in sshd, in the firewall and in fail2ban."
+    echo " If that login never happens, a timer puts everything"
+    echo " back on its own."
+    echo
+    echo " This reminder is also shown on every SSH login."
+    echo " To silence it:  touch /etc/xrdp-ssh-port-hint-off"
+
+fi
 
 if [[ "$BOOT_UPDATES" == true ]]; then
 

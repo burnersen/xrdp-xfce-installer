@@ -23,6 +23,7 @@ Two optional companion scripts complete the setup: `german.sh` for a German syst
 - UFW firewall, incoming denied by default, enabled **before** XRDP is installed
 - RDP restricted to a single IPv4 address, or publicly accessible after an explicit confirmation
 - Automatic detection and preservation of the active SSH port, so the running SSH connection is never locked out
+- Optional companion script that moves SSH off port 22, with a test from a second terminal before the old port is closed
 - Removal of stale RDP firewall rules before the new rule is applied, including rules left by an earlier run on a different port
 - fail2ban for both SSH and XRDP, with a custom XRDP filter that is verified during the installation
 - The chosen RDP port is checked against the SSH port and against everything already listening
@@ -88,6 +89,8 @@ Afterwards, reboot and connect with an RDP client:
 ```text
 SERVER_IP:PORT
 ```
+
+SSH is left on port 22. The installer says so at the end and points at [`ssh-port.sh`](#companion-script-ssh-port), which moves it safely if you want that.
 
 ---
 
@@ -172,7 +175,11 @@ The installer rejects a port that is already listening, that belongs to another 
 
 ## Firewall and fail2ban
 
-UFW denies incoming traffic by default. SSH stays reachable: the installer takes the port from three sources - the current SSH connection, the effective sshd configuration, and whatever `sshd` is actually listening on - and allows all of them. The third one is the safety net, because `sshd -T` fails on some configurations and locking the running connection out would leave the server unreachable.
+UFW denies incoming traffic by default. SSH stays reachable: the installer takes the port from four sources - the current SSH connection, the effective sshd configuration, the ports of `ssh.socket`, and whatever `sshd` is actually listening on - and allows every one of them. A port that is listed but no longer in use only costs one extra firewall rule; a port that is in use but not listed costs the way back into the server.
+
+`ssh.socket` is the one that is easy to miss. Ubuntu 22.10 and newer start sshd through socket activation, and the listening port then lives in the systemd unit rather than in `sshd_config`. On such a server `sshd -T` reports port 22 while SSH really answers somewhere else entirely - which is exactly the state a server ends up in when its port was moved the way most guides describe it. The installer reads `systemctl cat ssh.socket`, drop-ins included, so the real port is seen.
+
+One more detail: `sshd -T` aborts outright when `/run/sshd` is missing, and on a socket activated server that has not had an SSH connection since boot, it is missing. The installer creates the directory first, so this source does not silently contribute nothing.
 
 The firewall is configured **before** XRDP is installed. A freshly installed xrdp starts on port 3389 immediately, and on a server without a firewall that port would be exposed for the rest of the installation - on the one port that automated scanners try around the clock.
 
@@ -206,6 +213,8 @@ Two details make the difference between real protection and the appearance of it
 The XRDP filter is verified during the installation: it is run against sample `AUTHFAIL` lines, and against the real log if it already holds any. A filter that matches nothing is reported as a warning rather than left to look fine.
 
 If RDP is publicly accessible, use a long randomly generated password. fail2ban limits brute force attempts, but it is not a substitute for a strong password.
+
+SSH itself is left on port 22 by this script. Moving it is a separate step with its own script - see [Companion script: SSH port](#companion-script-ssh-port).
 
 ---
 
@@ -270,6 +279,59 @@ Optional, and the installer asks which mode to use.
 One detail worth knowing: the desktop mode needs the full JRE. The headless JRE package has no windowing support, so JDownloader falls back to headless mode even with a valid `DISPLAY` and no window ever appears. The installer picks the right package for the selected mode.
 
 The first start is interactive and asks for My JDownloader credentials, so it cannot be automated. The installer prints the exact command at the end.
+
+---
+
+## Companion script: SSH port
+
+`ssh-port.sh` moves SSH from port 22 to a port of your choice. Run it after `install.sh`.
+
+```bash
+curl -fsSLo ssh-port.sh https://raw.githubusercontent.com/burnersen/xrdp-xfce-installer/refs/heads/main/ssh-port.sh
+bash ssh-port.sh
+```
+
+Changing the SSH port is the one piece of server hardening that regularly ends with the admin locked out of their own machine, so this is a separate script rather than a question during the installation. It never closes a door before you have walked through the new one.
+
+**How it runs**
+
+1. sshd starts listening on the new port **as well as** the old one. UFW opens the new port and fail2ban is told about both. Nothing is taken away yet.
+2. You open a **second terminal** and log in on the new port. The script watches port 22's replacement itself and continues only once it has seen a real, established connection from outside. A connection from the server to itself does not count.
+3. Only then is the old port closed - in sshd, in the firewall and in fail2ban.
+
+If the terminal running the script dies between step 1 and step 3, a systemd timer puts everything back within 15 minutes. If you reconnect on the new port before that, `xrdp-ssh-port --confirm` finishes the job from there.
+
+```bash
+xrdp-ssh-port --status      # what is configured, and what really listens
+xrdp-ssh-port --confirm     # finish a pending change from a session on the new port
+xrdp-ssh-port --rollback    # undo a change that is not confirmed yet
+xrdp-ssh-port --revert      # go back to port 22 after a finished change
+```
+
+**Why this is not `sed -i s/22/2222/ sshd_config`**
+
+Ubuntu 22.10 and newer start sshd through **socket activation**. The listening port then comes from the systemd unit `ssh.socket`, not from `sshd_config`. Editing only `sshd_config` on such a system changes nothing at all - and closing port 22 in the firewall afterwards is exactly how the door shuts behind you.
+
+Ubuntu ships `/usr/lib/systemd/system-generators/sshd-socket-generator` for this. It reads `Port` out of `sshd_config` and writes the matching `ListenStream=` lines for `ssh.socket`, and it runs on `systemctl daemon-reload`. Where that generator exists, setting `Port` and reloading is the supported way; where it does not, the script writes the `ssh.socket` drop-in itself. Either way the result is then checked with `ss`: a port that is not really listening is rolled back instead of believed.
+
+**What else has to follow the port**
+
+- **UFW.** A new port nobody may reach is not a new port. The rule is added before sshd is reloaded, so the test in step 2 cannot fail for the wrong reason.
+- **fail2ban.** Its sshd jail bans per port - on Ubuntu 24.04 the nftables rule literally contains `dport { 22 }`. A jail left pointing at 22 keeps running, reports itself as healthy, and bans nobody. The new port is written to `/etc/fail2ban/jail.d/99-xrdp-ssh-port.local`, because fail2ban reads `jail.conf`, `jail.d/*.conf`, `jail.local` and then `jail.d/*.local` - and `install.sh` writes `jail.local`, so only a `.local` file inside `jail.d/` is read after it.
+- **Other `Port` lines.** cloud-init writes `/etc/ssh/sshd_config.d/50-cloud-init.conf`, and `Port` is one of the few sshd keywords that add up instead of overriding each other. Such a line would quietly hold port 22 open after the firewall rule for it was removed, so the script comments it out - with a backup, and with a marker so `--revert` puts it back exactly as it was.
+- **Your provider's firewall.** A Hetzner, AWS or Oracle firewall cannot be seen from inside the server, so the script cannot check it. It does not have to: if the new port is blocked there, the login in step 2 simply never arrives, nothing is closed, and the change is rolled back.
+
+**What it refuses to do**
+
+If `sshd_config` contains a `ListenAddress` line with its own port, such as `ListenAddress 0.0.0.0:22`, the script stops and explains why. Such a line overrides `Port` completely, and the socket generator then produces nothing at all - `sshd_config` would say one thing and the socket another. A `ListenAddress` without a port follows `Port` and is fine.
+
+**Open sessions are not dropped.** UFW lets established connections through, and Ubuntu's `ssh.service` uses `KillMode=process`, so a restart leaves the sessions that are already open alone.
+
+A reminder about this script is printed on every SSH login for as long as SSH is still on port 22, and goes quiet by itself once it is not. To silence it for good:
+
+```bash
+touch /etc/xrdp-ssh-port-hint-off
+```
 
 ---
 
@@ -381,6 +443,7 @@ If SSH is unreachable as well, use the provider's web console. Most VPS provider
 - `MaxSessions=3` is a limit for the whole server, not per user. It is plenty for one person and tight for several.
 - Installing `xfce4` pulls in `lightdm`, a login manager for a real monitor. It is useless on a headless server and costs a little memory, but it does not interfere with RDP, which uses display `:10` upwards. Disable it with `systemctl disable lightdm` if it bothers you.
 - pCloud and similar applications are not installed by the scripts. FUSE 2 is present, so AppImages run out of the box.
+- SSH stays on port 22 after `install.sh`. `ssh-port.sh` moves it, and a reminder is printed on every SSH login until it has been moved or silenced with `touch /etc/xrdp-ssh-port-hint-off`.
 - Moonlight has no clipboard sharing between client and server. RDP has.
 - On macOS RDP clients, keyboard layout and modifier keys may need additional client-side configuration.
 
