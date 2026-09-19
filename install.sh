@@ -20,7 +20,7 @@ set -Eeuo pipefail
 #   - Optional: JDownloader 2 (desktop app or headless service)
 # ==========================================================
 
-readonly INSTALLER_VERSION="2.1.3"
+readonly INSTALLER_VERSION="2.1.4"
 
 readonly DNS_PRIMARY="1.1.1.1"
 readonly DNS_SECONDARY="8.8.8.8"
@@ -1188,6 +1188,18 @@ PYTHON
 
         fi
 
+        # A backup that is byte-identical to the file it protects is
+        # only clutter - and on a re-run, where the addresses are
+        # already in place, that is every single run. This also
+        # covers the case where the backup was restored, because the
+        # file is then the original again.
+        if [[ -f "$NETPLAN_BACKUP" ]] &&
+           cmp -s "$NETPLAN_FILE" "$NETPLAN_BACKUP"; then
+
+            rm -f "$NETPLAN_BACKUP"
+
+        fi
+
     fi
 
 fi
@@ -2066,12 +2078,25 @@ if [[ "$MOZILLA_KEY_OK" == true ]]; then
     echo "Mozilla signing key verified: $MOZILLA_KEY_FINGERPRINT"
 
     # Remove the Snap build and the wrapper package only once the
-    # replacement is known to be available AND trustworthy.
-    if command -v snap >/dev/null 2>&1; then
-        snap remove --purge firefox >/dev/null 2>&1 || true
-    fi
+    # replacement is known to be available AND trustworthy - and
+    # only on the FIRST run.
+    #
+    # A repository file that is already there means an earlier run
+    # did this migration, so the installed "firefox" IS the Mozilla
+    # build. Purging it on every run would remove a working browser
+    # and reinstall it for nothing - and a re-run whose download
+    # fails would leave the machine with no browser at all, which
+    # is worse than the state it was in before.
+    if [[ ! -f /etc/apt/sources.list.d/mozilla.sources &&
+          ! -f /etc/apt/sources.list.d/mozilla.list ]]; then
 
-    apt-get purge -y firefox >/dev/null 2>&1 || true
+        if command -v snap >/dev/null 2>&1; then
+            snap remove --purge firefox >/dev/null 2>&1 || true
+        fi
+
+        apt-get purge -y firefox >/dev/null 2>&1 || true
+
+    fi
 
     install -m 0644 "$MOZILLA_KEY_TEMP" "$MOZILLA_KEYRING"
 
@@ -2156,27 +2181,44 @@ if [[ "$JD_MODE" != "none" ]]; then
     mkdir -p "$JD_DIR"
 
     JD_JAR="$JD_DIR/JDownloader.jar"
+    JD_JAR_TEMP="$JD_DIR/JDownloader.jar.download"
 
     # https, not http: this file is started as a user with sudo
     # rights, so an unencrypted download would be an invitation
     # to replace it on the way.
-    if wget -qO "$JD_JAR" "https://installer.jdownloader.org/JDownloader.jar"; then
+    #
+    # Download first, move second - the same reason as with the
+    # Mozilla key above. "wget -O" truncates its target the moment
+    # it opens it, so downloading straight onto the jar would
+    # destroy a working JDownloader on a re-run the instant the
+    # download fails. The temporary file lives in the same
+    # directory, so the move is a rename and cannot half finish.
+    if wget -qO "$JD_JAR_TEMP" "https://installer.jdownloader.org/JDownloader.jar"; then
 
-        JD_JAR_SIZE="$(stat -c '%s' "$JD_JAR" 2>/dev/null || echo 0)"
+        JD_JAR_SIZE="$(stat -c '%s' "$JD_JAR_TEMP" 2>/dev/null || echo 0)"
 
         if (( JD_JAR_SIZE < MIN_JAR_SIZE_BYTES )); then
 
-            warn "The downloaded JDownloader file is too small ($JD_JAR_SIZE bytes) - JDownloader was skipped."
-            rm -f "$JD_JAR"
-            JD_MODE="none"
+            warn "The downloaded JDownloader file is too small ($JD_JAR_SIZE bytes) - it was discarded."
+
+        elif ! mv -f "$JD_JAR_TEMP" "$JD_JAR"; then
+
+            warn "The downloaded JDownloader could not be put in place."
 
         fi
 
     else
 
         warn "Failed to download JDownloader."
-        JD_MODE="none"
 
+    fi
+
+    rm -f "$JD_JAR_TEMP"
+
+    # A jar from an earlier run is still good enough to go on with.
+    # Only a machine that has none at all skips JDownloader.
+    if [[ ! -f "$JD_JAR" ]]; then
+        JD_MODE="none"
     fi
 
 fi
