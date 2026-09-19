@@ -15,7 +15,7 @@ Two optional companion scripts complete the setup: `german.sh` for a German syst
 - XFCE desktop environment
 - XRDP with a configurable port instead of the default 3389
 - Persistent sessions: reconnect from any device, any IP and any window size and find the same desktop with all applications still running
-- Fixed colour depth, so different clients cannot create several parallel sessions for the same user
+- Capped colour depth, so the clients that ask for more than 24 bpp all land in the same session instead of opening one each
 - Polkit rules that prevent the usual colord authentication popups
 
 **Security**
@@ -36,7 +36,7 @@ Two optional companion scripts complete the setup: `german.sh` for a German syst
 - Firefox from Mozilla's APT repository instead of the Snap build
 - FUSE 2, so AppImage applications start without further setup
 - Optional JDownloader 2, either as a desktop application or as a systemd service
-- `xrdp-session-reset` helper command for the rare case of a stuck session. It spares a Sunshine desktop if one is installed, so resetting RDP does not cost you the Moonlight session
+- `xrdp-session-reset` helper command for the rare case of a stuck session. It spares a Sunshine desktop if one is installed, so resetting RDP does not cost you the Moonlight session (a headless JDownloader is not spared — see the section on stuck desktops)
 
 ---
 
@@ -142,17 +142,19 @@ resolvectl status
 
 This is the main difference to a plain XRDP setup.
 
-XRDP creates a separate session per colour depth. Different clients negotiate different values, which silently produces several parallel sessions for the same user. One of them ends up holding the desktop while the other shows a blank screen or hangs at "configuring remote computer".
+XRDP keys a session on the pair `<User, BitsPerPixel>`. Different clients negotiate different colour depths, which silently produces several parallel sessions for the same user. One of them ends up holding the desktop while the other shows a blank screen or hangs at "configuring remote computer".
 
 The installer sets:
 
 ```text
-max_bpp=24                  all clients get the same colour depth
-Policy=Default              one session per user
+max_bpp=24                  caps every client at 24 bpp
+Policy=Default              session per <user, colour depth>
 KillDisconnected=false      the session survives a disconnect
 DisconnectedTimeLimit=0     a disconnected session never expires
 MaxSessions=3               stale sessions surface early
 ```
+
+`max_bpp` is an upper limit, not a fixed value, and the colour depth cannot be removed from the session identity: `sesman.ini(5)` documents `Policy=Default` as "the same as `UB`" and notes that "the U and B criteria cannot be turned off". So the cap folds together every client that asks for *more* than 24 bpp — which covers mstsc and FreeRDP, both of which ask for 32 — but a client deliberately configured for a *lower* depth, say a Remmina profile set to 16 bpp, still opens a session of its own. If you ever see two sessions for one user, that is where to look.
 
 The result:
 
@@ -410,7 +412,7 @@ A stuck window manager can leave a session that refuses new connections. SSH sti
 
 | Command | Terminates | Leaves alone | Installed by |
 |---|---|---|---|
-| `xrdp-session-reset` | the RDP session processes | Sunshine, PipeWire | `install.sh` |
+| `xrdp-session-reset` | every process of the RDP user that is not spared | Sunshine, PipeWire | `install.sh` |
 | `sunshine-session-reset` | the three `sunshine-*` services | every RDP session | `sunshine.sh` |
 
 If everything is stuck at once, run both — one after the other.
@@ -424,6 +426,8 @@ This terminates the RDP session processes of the desktop user and restarts both 
 It also removes the socket and lock file an X server leaves behind, because a new session on the same display number cannot start while they are there. Only displays with no X server still running are cleaned up, so a display belonging to another service is never touched.
 
 Which processes belong to Sunshine is read from the systemd control groups of its services, not guessed from process names. Without `sunshine.sh` installed there is nothing to spare and every process of the user is terminated, exactly as before.
+
+The name is narrower than the effect: everything of the RDP user that is not on the spared list goes, not only the RDP session. A headless JDownloader runs as the same user, so it is terminated too. systemd starts it again because of `Restart=always`, but a download in flight is lost.
 
 ```bash
 sunshine-session-reset

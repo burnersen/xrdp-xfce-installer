@@ -20,7 +20,7 @@ set -Eeuo pipefail
 #   - Optional: JDownloader 2 (desktop app or headless service)
 # ==========================================================
 
-readonly INSTALLER_VERSION="2.1.1"
+readonly INSTALLER_VERSION="2.1.2"
 
 readonly DNS_PRIMARY="1.1.1.1"
 readonly DNS_SECONDARY="8.8.8.8"
@@ -34,6 +34,17 @@ readonly DEFAULT_RDP_PORT=3389
 readonly SESMAN_LOG="/var/log/xrdp-sesman.log"
 readonly XRDP_FILTER="/etc/fail2ban/filter.d/xrdp-sesman.conf"
 readonly JD_DIR="/opt/jdownloader"
+
+# The fingerprint Mozilla publishes for its APT signing key.
+#
+# Checking it matters more than it looks: the key's user ID reads
+# "Artifact Registry Repository Signer
+# <artifact-registry-repository-signer@google.com>", because
+# Mozilla hosts the repository on Google Artifact Registry. The
+# key therefore does not say "Mozilla" anywhere, and the
+# fingerprint is the only thing tying the downloaded file to the
+# key Mozilla documents.
+readonly MOZILLA_KEY_FINGERPRINT="35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3"
 
 readonly BOOT_UPDATE_SCRIPT="/usr/local/bin/xrdp-boot-update"
 readonly BOOT_UPDATE_SERVICE="/etc/systemd/system/xrdp-boot-update.service"
@@ -795,7 +806,8 @@ if [[ "$BOOT_UPDATES" =~ ^[Yy]$ ]]; then
     BOOT_UPDATES=true
 
     echo "NOTE: Updates are installed while the server boots."
-    echo "      RDP waits for them; SSH stays available throughout."
+    echo "      RDP waits for them; SSH is not ordered behind the"
+    echo "      update, so it comes up while the update runs."
     echo "      Security updates keep arriving in the background,"
     echo "      but no service is restarted while you are working."
 
@@ -906,14 +918,39 @@ if [[ "$CHANGE_DNS" == false ]]; then
 
 else
 
+    # A file that already carries name servers is the obvious one
+    # to edit.
+    #
     # "sed -n 1p" instead of "head -n1": a reader that closes the
     # pipe early kills grep with SIGPIPE, which "set -o pipefail"
-    # would report as a failure.
+    # would report as a failure. Same below.
     NETPLAN_FILE="$(grep -l 'nameservers' /etc/netplan/*.yaml 2>/dev/null | sed -n '1p' || true)"
+
+    # But most cloud images have no name servers in netplan at all -
+    # they simply take what DHCP hands them:
+    #
+    #   network:
+    #     version: 2
+    #     ethernets:
+    #       ens3:
+    #         dhcp4: true
+    #
+    # Looking only for "nameservers" would skip those, and the
+    # question above would have been answered for nothing. So fall
+    # back to the file that defines the network devices; the block
+    # is added to it below.
+    if [[ -z "$NETPLAN_FILE" ]]; then
+
+        NETPLAN_FILE="$(
+            grep -lE '^[[:space:]]*(ethernets|bonds|bridges|vlans|wifis):' \
+                /etc/netplan/*.yaml 2>/dev/null | sed -n '1p' || true
+        )"
+
+    fi
 
     if [[ -z "$NETPLAN_FILE" ]]; then
 
-        echo "No netplan file with name servers found - keeping current setup."
+        echo "No netplan file with a network device found - keeping current setup."
 
     else
 
@@ -966,6 +1003,19 @@ path, primary, secondary = sys.argv[1], sys.argv[2], sys.argv[3]
 
 DEVICE_TYPES = ("ethernets", "bonds", "bridges", "vlans", "wifis")
 
+
+def is_enabled(value):
+    """True for the several ways netplan can spell an enabled flag."""
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "on", "1")
+
+    return False
+
+
 with open(path) as handle:
     config = yaml.safe_load(handle) or {}
 
@@ -995,6 +1045,27 @@ for device_type in DEVICE_TYPES:
             device["nameservers"] = nameservers
 
         nameservers["addresses"] = [primary, secondary]
+
+        # Setting the addresses is not enough on its own. While
+        # DHCP is on, the name servers it hands out take
+        # PRECEDENCE over the ones configured here - use-dns
+        # defaults to true. Without turning that off, the file
+        # would look changed and the provider's resolvers would
+        # still be the ones answering.
+        for version in (4, 6):
+
+            if not is_enabled(device.get("dhcp%d" % version)):
+                continue
+
+            key = "dhcp%d-overrides" % version
+            overrides = device.get(key)
+
+            if not isinstance(overrides, dict):
+                overrides = {}
+                device[key] = overrides
+
+            overrides["use-dns"] = False
+
         changed += 1
 
 if changed == 0:
@@ -1401,13 +1472,22 @@ fi
 
 set_ini_key "$XRDP_INI" "Globals" "port" "$RDP_PORT" || true
 
-# Fixed colour depth.
+# Colour depth cap.
 #
-# XRDP creates a SEPARATE session per colour depth. Different
-# clients negotiate different values, which silently produces
-# several parallel sessions for the same user.
+# XRDP keys a session on <User, BitsPerPixel>. sesman.ini(5)
+# documents Policy=Default as "the same as UB" and states that
+# "the U and B criteria cannot be turned off", so the colour
+# depth is always part of the session identity. Different
+# clients negotiating different values therefore produce
+# several parallel sessions for one user - one of them holds
+# the desktop while the other shows a blank screen.
 #
-# Capping the value keeps all clients in one single session.
+# max_bpp is an UPPER LIMIT, not a fixed value. It folds every
+# client that asks for more than 24 into one session, which
+# covers mstsc and FreeRDP, both of which ask for 32. It cannot
+# fold a client that deliberately negotiates LESS - a Remmina
+# profile set to 16 bpp still opens a session of its own. That
+# is a property of xrdp, not something this setting removes.
 
 set_ini_key "$XRDP_INI" "Globals" "max_bpp" "24" || true
 
@@ -1423,8 +1503,10 @@ set_ini_key "$XRDP_INI" "Globals" "max_bpp" "24" || true
 #   KillDisconnected=false    keep the session after disconnect
 #   DisconnectedTimeLimit=0   never expire a disconnected session
 #
-# Note: combined with max_bpp above, "Default" means exactly
-# one session per user.
+# Note: together with max_bpp above, every client that asks for
+# 24 bpp or more shares one session. A client configured for a
+# lower colour depth still opens a second one - see the comment
+# on max_bpp.
 # ----------------------------------------------------------
 
 echo
@@ -1624,9 +1706,29 @@ echo
 echo "[10/14] Configuring fail2ban"
 
 cat > "$XRDP_FILTER" <<'EOF'
-# Matches the AUTHFAIL line written by xrdp-sesman, e.g.
+# Matches the AUTHFAIL line written by xrdp-sesman.
 #
-#   [20260101-12:00:00] [INFO ] AUTHFAIL: user=name ip=::ffff:203.0.113.10 time=1767265200
+# xrdp CHANGED its timestamp format between 0.9 and 0.10, so
+# both have to be read:
+#
+#   0.9  [20260101-12:00:00] [INFO ] AUTHFAIL: user=name ip=::ffff:203.0.113.10 time=1767265200
+#   0.10 [2026-01-01T12:00:00.065+0000] [INFO ] AUTHFAIL: user=name ip=203.0.113.10 time=1767265200
+#
+# Ubuntu 24.04 ships xrdp 0.9.24, Ubuntu 26.04 ships 0.10.1.
+# With only the 0.9 pattern the jail still bans on 26.04 -
+# fail2ban falls back to the time it read the line - but every
+# timestamp in the log is then ignored. On a restart, or after
+# a log rotation, old entries are treated as if they had just
+# happened.
+#
+# Both datepattern lines swallow the CLOSING bracket as well.
+# fail2ban removes whatever the datepattern matched before it
+# applies failregex, so a pattern that stops after the seconds
+# would leave ".065+0000]" in front of the message and the
+# failregex below would no longer match at all.
+#
+# The milliseconds and the zone offset are optional so that a
+# future xrdp that drops either one still parses.
 #
 # The optional ::ffff: prefix is how an IPv4 address is
 # represented inside an IPv6 field. It is matched but NOT
@@ -1645,6 +1747,7 @@ cat > "$XRDP_FILTER" <<'EOF'
 failregex = ^(?:\s*\[[^\]]*\])*\s*AUTHFAIL:\s+user=\S*\s+ip=(?:::ffff:)?<HOST>\s+time=\d+\s*$
 ignoreregex =
 datepattern = ^\[%%Y%%m%%d-%%H:%%M:%%S\]
+              ^\[%%Y-%%m-%%dT%%H:%%M:%%S(?:\.%%f)?(?:%%z)?\]
 EOF
 
 chmod 0644 "$XRDP_FILTER"
@@ -1723,22 +1826,51 @@ verify_xrdp_filter() {
         return 1
     fi
 
-    # Two genuine AUTHFAIL lines: one with the ::ffff: prefix,
-    # one without.
+    # Four genuine AUTHFAIL lines: both timestamp formats, and
+    # within each one an address with and without the ::ffff:
+    # prefix.
     cat > "$sample_log" <<'EOF'
 [20260101-12:00:00] [INFO ] AUTHFAIL: user=testuser ip=::ffff:203.0.113.10 time=1767265200
 [20260101-12:00:05] [INFO ] AUTHFAIL: user=testuser ip=198.51.100.23 time=1767265205
+[2026-01-01T12:00:00.065+0000] [INFO ] AUTHFAIL: user=testuser ip=::ffff:203.0.113.10 time=1767265200
+[2026-01-01T12:00:05.123+0000] [INFO ] AUTHFAIL: user=testuser ip=198.51.100.23 time=1767265205
 EOF
 
     output="$(fail2ban-regex "$sample_log" "$XRDP_FILTER" 2>&1 || true)"
     rm -f "$sample_log"
 
-    if [[ "$output" != *"2 matched"* ]]; then
+    if [[ "$output" != *"4 matched"* ]]; then
         warn "The XRDP fail2ban filter did not match the test lines - RDP brute force protection is probably not working."
         return 1
     fi
 
-    echo "XRDP filter check: 2 of 2 test lines matched."
+    # Matching is only half of it. If the datepattern reads no
+    # timestamp, fail2ban silently falls back to the moment it
+    # happened to read the line - the jail keeps working, but
+    # every time in the log is thrown away, and after a restart
+    # old entries look like they just happened.
+    #
+    # This is exactly how the 0.9-only datepattern used to pass
+    # this check on an xrdp 0.10 server.
+    date_hits="$(
+        printf '%s\n' "$output" | awk '
+            /Date template hits/ { in_section = 1; next }
+            in_section && /^`/   { in_section = 0 }
+            in_section && /^\|[[:space:]]+\[[0-9]+\]/ {
+                count = $0
+                sub(/^\|[[:space:]]+\[/, "", count)
+                sub(/\].*$/, "", count)
+                total += count
+            }
+            END { print total + 0 }'
+    )"
+
+    if (( date_hits < 4 )); then
+        warn "The XRDP fail2ban filter read a timestamp from only $date_hits of 4 test lines - check the datepattern against the xrdp version on this server."
+        return 1
+    fi
+
+    echo "XRDP filter check: 4 of 4 test lines matched, timestamps read from all of them."
 
     # A test line only proves that the filter matches the format
     # this installer knows. If the server has already logged real
@@ -1862,13 +1994,60 @@ MOZILLA_KEY_TEMP="/tmp/packages.mozilla.org.asc"
 
 install -d -m 0755 /etc/apt/keyrings
 
+# HTTPS says the file came from packages.mozilla.org. It does
+# not say the file is the key Mozilla means, so the fingerprint
+# is compared against the published one before anything trusts
+# it.
+mozilla_key_is_genuine() {
+    local file="$1"
+    local fingerprint
+
+    if ! command -v gpg >/dev/null 2>&1; then
+        warn "gpg is missing - Mozilla's signing key could not be verified."
+        return 1
+    fi
+
+    while read -r fingerprint; do
+
+        if [[ "$fingerprint" == "$MOZILLA_KEY_FINGERPRINT" ]]; then
+            return 0
+        fi
+
+    done < <(
+        gpg --show-keys --with-colons --with-fingerprint "$file" 2>/dev/null |
+            awk -F: '$1 == "fpr" { print $10 }'
+    )
+
+    return 1
+}
+
+MOZILLA_KEY_OK=false
+
 # Download first, install second. Redirecting wget straight
 # into the keyring would leave an empty file behind if the
 # download fails.
-if wget -qO "$MOZILLA_KEY_TEMP" "https://packages.mozilla.org/apt/repo-signing-key.gpg"; then
+if ! wget -qO "$MOZILLA_KEY_TEMP" "https://packages.mozilla.org/apt/repo-signing-key.gpg"; then
 
-    # Remove the Snap build and the wrapper package only once
-    # the replacement is known to be available.
+    warn "Could not download Mozilla's signing key - Firefox was skipped."
+
+elif ! mozilla_key_is_genuine "$MOZILLA_KEY_TEMP"; then
+
+    # Deliberately NOT fatal, and deliberately before the Snap is
+    # touched: the machine keeps the browser it already has.
+    warn "Mozilla's signing key does not carry the expected fingerprint - Firefox was skipped and the Snap build was left in place."
+
+else
+
+    MOZILLA_KEY_OK=true
+
+fi
+
+if [[ "$MOZILLA_KEY_OK" == true ]]; then
+
+    echo "Mozilla signing key verified: $MOZILLA_KEY_FINGERPRINT"
+
+    # Remove the Snap build and the wrapper package only once the
+    # replacement is known to be available AND trustworthy.
     if command -v snap >/dev/null 2>&1; then
         snap remove --purge firefox >/dev/null 2>&1 || true
     fi
@@ -1890,10 +2069,6 @@ if wget -qO "$MOZILLA_KEY_TEMP" "https://packages.mozilla.org/apt/repo-signing-k
     if ! apt-get install -y firefox; then
         warn "Firefox installation failed."
     fi
-
-else
-
-    warn "Could not download Mozilla's signing key - Firefox was skipped."
 
 fi
 
@@ -2026,6 +2201,13 @@ fi
 # A stuck window manager can leave a session that refuses
 # new connections. This helper clears it from SSH.
 #
+# What it really does is broader than the name suggests: it
+# terminates EVERY process of the RDP user that is not on the
+# spared list below, not just the ones belonging to the RDP
+# session. A headless JDownloader runs as that user too, so it
+# is terminated as well - systemd restarts it, but a download
+# in flight is lost.
+#
 # Killing the processes is not enough: the X server leaves a
 # socket and a lock file behind, and a new session on the same
 # display number then fails to start. Those leftovers are
@@ -2043,7 +2225,8 @@ if [[ "\$EUID" -ne 0 ]]; then
     exit 1
 fi
 
-echo "Terminating the RDP session processes of user '$USERNAME'..."
+echo "Terminating the processes of user '$USERNAME' (RDP session and"
+echo "anything else of theirs that is not on the spared list)..."
 
 # Processes that must SURVIVE: the Sunshine setup from sunshine.sh
 # (its own screen, desktop and stream) and the user's own systemd
@@ -2629,7 +2812,12 @@ if [[ "$BOOT_UPDATES" == true ]]; then
     echo
     echo " The system updates itself while it boots, before RDP"
     echo " becomes available. Nothing is upgraded or restarted while"
-    echo " you are working. SSH is reachable during the update."
+    echo " you are working."
+    echo
+    echo " SSH is not ordered behind the update service, so it comes"
+    echo " up while the update runs. That is not a guarantee of an"
+    echo " unbroken connection: an upgrade can still restart the"
+    echo " network stack or sshd itself."
     echo
     echo " What happened last time:"
     echo "   tail -n 20 $BOOT_UPDATE_LOG"
