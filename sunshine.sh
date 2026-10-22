@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 burnersen (https://github.com/burnersen)
 #
 # ==========================================================
 #  Sunshine on a server without a screen,

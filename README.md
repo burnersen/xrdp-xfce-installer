@@ -458,3 +458,12 @@ If SSH is unreachable as well, use the provider's web console. Most VPS provider
 ## Credits
 
 Based on the [xrdp-xfce-installer](https://github.com/Alishka1408/xrdp-xfce-installer) by Alishka1408, extended with persistent sessions, a configurable RDP port, fail2ban, AppImage support and optional JDownloader installation.
+
+## License
+
+This repository contains files under different terms:
+
+| File | License |
+|---|---|
+| `german.sh`, `ssh-port.sh`, `sunshine.sh` | [GPLv3](LICENSES/GPL-3.0-only.txt), written from scratch by burnersen |
+| `install.sh` | Based on the original script by Alishka1408, which was published without a license. Until the original author clarifies the licensing, no license is granted for this file. |
