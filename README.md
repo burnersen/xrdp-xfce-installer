@@ -4,6 +4,8 @@ Interactive installer for a XFCE remote desktop on Ubuntu, with persistent sessi
 
 The script installs a lightweight XFCE desktop, makes it reachable over RDP, creates a non-root sudo user, installs browsers and secures the server. It is written for clean Ubuntu installations, for example on a fresh VPS.
 
+🌐 Website: [tech.burnersen.de/en/tools/xrdp-xfce-installer-en](https://tech.burnersen.de/en/tools/xrdp-xfce-installer-en/) · 🇩🇪 Auf Deutsch: [tech.burnersen.de/tools/xrdp-xfce-installer](https://tech.burnersen.de/tools/xrdp-xfce-installer/)
+
 Two optional companion scripts complete the setup: `german.sh` for a German system, and `sunshine.sh` for a second desktop that can be streamed with Moonlight. Run them in that order — `install.sh`, then `german.sh`, then `sunshine.sh` — so the streamed desktop comes up with the right language and keyboard from its very first start.
 
 ---
