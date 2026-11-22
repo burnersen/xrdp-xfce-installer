@@ -10,6 +10,8 @@ Two optional companion scripts complete the setup: `german.sh` for a German syst
 
 ---
 
+> ⚠️ **Before you start:** this is free hobby software without any warranty, and you use it at your own risk. The installer runs as root and changes the firewall, SSH, user accounts and services. Use it on a fresh server and keep another way in, such as your provider's web console. Details in the disclaimer at the end.
+
 ## Features
 
 **Desktop and remote access**
@@ -24,7 +26,7 @@ Two optional companion scripts complete the setup: `german.sh` for a German syst
 
 - UFW firewall, incoming denied by default, enabled **before** XRDP is installed
 - RDP restricted to a single IPv4 address, or publicly accessible after an explicit confirmation
-- Automatic detection and preservation of the active SSH port, so the running SSH connection is never locked out
+- Automatic detection and preservation of the active SSH port, so the running SSH connection is not locked out by the firewall
 - Optional companion script that moves SSH off port 22, with a test from a second terminal before the old port is closed
 - Removal of stale RDP firewall rules before the new rule is applied, including rules left by an earlier run on a different port
 - fail2ban for both SSH and XRDP, with a custom XRDP filter that is verified during the installation
@@ -33,7 +35,7 @@ Two optional companion scripts complete the setup: `german.sh` for a German syst
 **Extras**
 
 - Optional fast DNS resolvers, replacing name servers that make every page load slowly
-- Optional update policy that moves all upgrades to boot time, so nothing is ever restarted under a running session
+- Optional update policy that moves all upgrades to boot time, so updates do not restart services under a running session
 - Google Chrome on amd64, Chromium elsewhere
 - Firefox from Mozilla's APT repository instead of the Snap build
 - FUSE 2, so AppImage applications start without further setup
@@ -458,6 +460,12 @@ If SSH is unreachable as well, use the provider's web console. Most VPS provider
 ## Credits
 
 Based on the [xrdp-xfce-installer](https://github.com/Alishka1408/xrdp-xfce-installer) by Alishka1408, extended with persistent sessions, a configurable RDP port, fail2ban, AppImage support and optional JDownloader installation.
+
+## ⚠️ Disclaimer
+
+This installer is free hobby software, provided **"as is", without any warranty or condition of any kind**. It was built and tested with care, but you use it **at your own risk**. It runs as root and changes the firewall, SSH, user accounts and system services. Use it on a fresh server, read the script before you run it, and make sure you can reach the server another way (for example your provider's web console) in case SSH or RDP stops working.
+
+Where this README describes what This installer does, checks or never does, that is how it is designed to work, not a promise or guarantee: software can have bugs, and systems, services and other programs do not always behave as expected. As far as the applicable law allows, the author is not liable for any damages or data loss arising from the use of this software. See sections 15 and 16 of the [license](LICENSES/GPL-3.0-only.txt).
 
 ## License
 
